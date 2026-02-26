@@ -35,6 +35,10 @@ def vmap_and_train(args: Hyperparams,
     if not args.save_runner_state:
         del out['runner_state']
 
+    # Pull intermediate checkpoints out of out before saving — we write them
+    # as separate Orbax dirs rather than a single batched array.
+    ckpt_train_states = out.pop('ckpt_train_states', None)
+
     results_path = get_results_path(args, return_npy=False)  # returns a results directory
 
     all_results = {
@@ -55,4 +59,16 @@ def vmap_and_train(args: Hyperparams,
 
     print(f"Saving results to {results_path}")
     orbax_checkpointer.save(results_path, all_results, save_args=save_args)
+
+    # Save each intermediate checkpoint as its own subdirectory: checkpoint_0, checkpoint_1, ...
+    # Shape of each leaf in ckpt_train_states: [n_hparams, n_seeds, num_checkpoints, *leaf_shape]
+    if ckpt_train_states is not None:
+        ckpt_train_states = jax.device_get(ckpt_train_states)
+        num_ckpts = getattr(args, 'num_checkpoints', 0)
+        for i in range(num_ckpts):
+            ckpt_i = jax.tree.map(lambda x, idx=i: x[:, :, idx], ckpt_train_states)
+            ckpt_path = results_path / f"checkpoint_{i}"
+            orbax_checkpointer.save(ckpt_path, ckpt_i, save_args=orbax_utils.save_args_from_target(ckpt_i))
+        print(f"Saved {num_ckpts} checkpoints to {results_path}/checkpoint_{{0..{num_ckpts - 1}}}")
+
     print("Done.")

@@ -59,6 +59,7 @@ class PPOHyperparams(Tap):
     steps_log_freq: int = 1  # Over num_steps, how often do we save training statistics (returns etc.)?
     update_log_freq: int = 1  # Over all updates, how often do we save training statistics?
     save_checkpoints: bool = False  # Do we save train_state along with our per timestep outputs?
+    num_checkpoints: int = 10  # [save_checkpoints] How many intermediate checkpoints to save?
     save_runner_state: bool = False  # Do we save the checkpoint in the end?
     sweep_type: str = 'grid'  # grid (sweeps all listed hyperparams) | random (randomly rejection samples sets of hyperparams)
     n_random_hparams: int = 1  # [sweep_type = random] How many randomly sampled hyperparams do we use?
@@ -142,6 +143,7 @@ class TransformerHyperparams(Tap):
     steps_log_freq: int = 1
     update_log_freq: int = 1
     save_checkpoints: bool = False  # Do we save train_state along with our per timestep outputs?
+    num_checkpoints: int = 10  # [save_checkpoints] How many intermediate checkpoints to save?
     save_runner_state: bool = False  # Do we save the checkpoint in the end?
     sweep_type: str = 'grid'  # grid (sweeps all listed hyperparams) | random (randomly rejection samples sets of hyperparams)
     n_random_hparams: int = 1  # [sweep_type = random] How many randomly sampled hyperparams do we use?

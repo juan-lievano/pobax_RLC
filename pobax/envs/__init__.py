@@ -193,7 +193,19 @@ def get_env(
     if fo_pomdp:
         env_name = env_name.split("_")[-1]
 
-    if env_name.startswith("tmaze_"):
+    elif env_name.startswith("compass_world_"):
+
+        try:
+            grid_size = int(env_name.split("_")[-1])
+        except ValueError:
+            raise ValueError(f"Invalid CompassWorld name: {env_name}. Expected compass_world_<int>")
+
+        assert grid_size >= 4, "grid_size for CompassWorld must be at least 4"
+
+        env = CompassWorld(size=grid_size)
+        env_params = env.default_params
+
+    elif env_name.startswith("tmaze_"):
         hallway_length = int(env_name.split("_")[-1])
         env = TMaze(hallway_length=hallway_length, perfect_memory=perfect_memory)
         env_params = env.default_params
