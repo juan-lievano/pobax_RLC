@@ -165,3 +165,4 @@ scripts/videos
 scripts/runs
 .onager/
 notes/
+.DS_Store
