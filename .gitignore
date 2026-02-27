@@ -169,3 +169,6 @@ notes/
 
 # ignore results cause it's too heavy
 probe_results/
+
+# ignore slurm_scripts cause i haven't been able to push from the slurm
+slurm_bash_scripts/
