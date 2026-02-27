@@ -166,3 +166,6 @@ scripts/runs
 .onager/
 notes/
 .DS_Store
+
+# ignore results cause it's too heavy
+probe_results/
