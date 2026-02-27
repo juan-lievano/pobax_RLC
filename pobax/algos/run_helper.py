@@ -1,8 +1,10 @@
 from typing import Callable
 from time import time
+from pprint import pprint
 
 from flax.training import orbax_utils
 import jax
+import numpy as np
 import orbax.checkpoint
 
 from pobax.config import Hyperparams
@@ -25,7 +27,6 @@ def vmap_and_train(args: Hyperparams,
 
     new_t = time()
     total_runtime = new_t - t
-    print('Total runtime:', total_runtime)
 
     # our final_eval_metric returns max_num_steps.
     # we can filter that down by the max episode length amongst the runs.
@@ -52,6 +53,20 @@ def vmap_and_train(args: Hyperparams,
 
     # Convert to numpy
     all_results = jax.device_get(all_results)
+
+    # Print summary to stdout (captured by SLURM log)
+    steps_per_sec = args.total_steps / total_runtime
+    eval_rets = all_results['final_eval']['returned_episode_returns']
+    eval_mask = all_results['final_eval']['returned_episode']
+    completed = np.asarray(eval_rets)[np.asarray(eval_mask)]
+    print("----- SUMMARY -----")
+    print("Args used:")
+    pprint(args.as_dict())
+    if completed.size:
+        print(f"Final eval episodic return: mean={completed.mean():.4f}, std={completed.std():.4f}, n={completed.size}")
+    else:
+        print("Final eval episodic return: no completed episodes")
+    print(f"Total runtime: {total_runtime:.1f}s ({steps_per_sec:,.0f} env steps/sec)")
 
     # Save all results with Orbax
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
