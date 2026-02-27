@@ -11,6 +11,7 @@ from pobax.envs.classic import load_pomdp
 from pobax.envs.jax.battleship import Battleship
 from pobax.envs.jax.battleship import PerfectMemoryWrapper as BSPerfectMemoryWrapper
 from pobax.envs.jax.compass_world import CompassWorld
+from pobax.envs.jax.marquee import Marquee
 from pobax.envs.jax.fishing import Fishing
 from pobax.envs.jax.pocman import PocMan
 from pobax.envs.jax.pocman import PocManStateWrapper as PMPerfectMemoryWrapper
@@ -205,6 +206,12 @@ def get_env(
         env = CompassWorld(size=grid_size)
         env_params = env.default_params
 
+    elif env_name.startswith("marquee_"):
+        # env_name format: "marquee_<n_bulbs>_<n_goals>", e.g. "marquee_40_16"
+        config_path = envs_dir / "configs" / f"{env_name}_config.json"
+        env = Marquee(config_path=str(config_path))
+        env_params = env.default_params
+
     elif env_name.startswith("tmaze_"):
         hallway_length = int(env_name.split("_")[-1])
         env = TMaze(hallway_length=hallway_length, perfect_memory=perfect_memory)
@@ -355,7 +362,21 @@ def get_transformer_env(
     if fo_pomdp:
         env_name = env_name.split("_")[-1]
 
-    if env_name.startswith("tmaze_"):
+    if env_name.startswith("compass_world_"):
+        try:
+            grid_size = int(env_name.split("_")[-1])
+        except ValueError:
+            raise ValueError(f"Invalid CompassWorld name: {env_name}. Expected compass_world_<int>")
+        assert grid_size >= 4, "grid_size for CompassWorld must be at least 4"
+        env = CompassWorld(size=grid_size)
+        env_params = env.default_params
+
+    elif env_name.startswith("marquee_"):
+        config_path = envs_dir / "configs" / f"{env_name}_config.json"
+        env = Marquee(config_path=str(config_path))
+        env_params = env.default_params
+
+    elif env_name.startswith("tmaze_"):
         hallway_length = int(env_name.split("_")[-1])
         env = TMaze(hallway_length=hallway_length)
         env_params = env.default_params

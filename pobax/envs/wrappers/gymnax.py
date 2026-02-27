@@ -561,6 +561,12 @@ class ActionConcatWrapper(GymnaxWrapper):
         if isinstance(action_space, spaces.Discrete):
             action_vec = jnp.eye(action_space.n)[action]
 
+        # When done=True, gymnax auto-resets: `obs` and `state` are already from the
+        # NEW episode.  Zero the action vector so the first observation of the new
+        # episode correctly has no "previous action" (matching reset() behaviour).
+        # TODO: make sure this makes sense
+        action_vec = jnp.where(done, jnp.zeros_like(action_vec), action_vec)
+
         obs_space = self.observation_space(params)
         maybe_obs_dict = obs
         if isinstance(maybe_obs_dict, Observation):
