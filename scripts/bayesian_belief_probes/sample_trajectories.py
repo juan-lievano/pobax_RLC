@@ -47,13 +47,30 @@ from pobax.models.network import ScannedRNN
 # Core rollout
 # ---------------------------------------------------------------------------
 
-def build_rollout_fn(model, env, env_params, hidden_size: int, max_len: int, memoryless: bool):
+def build_rollout_fn(
+    model,
+    env,
+    env_params,
+    hidden_size: int,
+    max_len: int,
+    memoryless: bool,
+    extras_fn,
+    extras_dim: int,
+    action_concat: bool,
+    action_dim: int,
+):
     """
     Returns a JIT-compiled function:
-        rollout(params_all_seeds, rng_keys) -> (obs, actions, pos, dir, hidden, masks, lengths)
+        rollout(params_all_seeds, rng_keys)
+            -> (obs, actions, extras, hidden, masks, lengths)
 
     params_all_seeds: pytree with leaves [n_seeds, *param_shape]
     rng_keys:         [n_traj]  PRNGKeys (same starting keys for all seeds)
+    extras_fn:        state -> jnp.ndarray [extras_dim]  (env-specific extras)
+    extras_dim:       int  (0 for no extras)
+    action_concat:    if True, prepend one-hot prev_action to obs before the model
+                      (must match how the checkpoint was trained)
+    action_dim:       size of the action space (needed to build the one-hot vector)
     """
 
     def rollout_single(rng_key, params_one_seed):
@@ -67,13 +84,21 @@ def build_rollout_fn(model, env, env_params, hidden_size: int, max_len: int, mem
             hidden = ScannedRNN.initialize_carry(1, hidden_size)
 
         done = jnp.array(False)
+        # Carry prev_action_onehot always; it is only used when action_concat=True.
+        # Initialised to zeros (equivalent to ActionConcatWrapper.reset behaviour).
+        prev_action_onehot = jnp.zeros(action_dim, dtype=jnp.float32)
 
         def step_fn(carry, _):
-            rng, state, obs, hidden, done = carry
+            rng, state, obs, hidden, done, prev_action_onehot = carry
             rng, k_step, k_act = jr.split(rng, 3)
 
-            obs_in   = obs[None, None, :].astype(jnp.float32)  # [1, 1, obs_dim]
-            done_in  = done[None, None]                          # [1, 1]
+            # Replicate ActionConcatWrapper: prepend prev_action to obs fed to model.
+            if action_concat:
+                obs_model = jnp.concatenate([obs, prev_action_onehot])
+            else:
+                obs_model = obs
+            obs_in   = obs_model[None, None, :].astype(jnp.float32)  # [1, 1, obs_dim]
+            done_in  = done[None, None]                                # [1, 1]
             obs_dict = Observation(obs=obs_in)  # action_mask=None is the default
 
             hidden_new, pi, _ = model.apply(params_one_seed, hidden, (obs_dict, done_in))
@@ -88,6 +113,11 @@ def build_rollout_fn(model, env, env_params, hidden_size: int, max_len: int, mem
             )
             next_done_flag = jnp.logical_or(done, next_done)
 
+            # One-hot of current action becomes prev_action for the next step.
+            new_prev_action_onehot = jnp.eye(action_dim, dtype=jnp.float32)[action]
+            # Freeze after episode ends (consistent with obs/hidden freeze above).
+            new_prev_action_onehot = jnp.where(done, prev_action_onehot, new_prev_action_onehot)
+
             next_carry = (
                 rng,
                 jax.tree_util.tree_map(
@@ -96,23 +126,23 @@ def build_rollout_fn(model, env, env_params, hidden_size: int, max_len: int, mem
                 jnp.where(done, obs, next_obs.astype(jnp.float32)),
                 hidden_rec,
                 next_done_flag,
+                new_prev_action_onehot,
             )
             step_out = (
-                obs,            # [obs_dim]     observation at this step
-                action,         # []            action taken
-                state.pos,      # [2]           position (CompassWorld extra)
-                state.dir,      # []            direction (CompassWorld extra)
-                hidden_rec[0],  # [hidden_size] squeeze batch dim for storage
-                mask_out,       # []            validity mask
+                obs,               # [obs_dim]        raw obs (no prev_action) for storage
+                action,            # []               action taken
+                extras_fn(state),  # [extras_dim]     env-specific extras
+                hidden_rec[0],     # [hidden_size]    squeeze batch dim for storage
+                mask_out,          # []               validity mask
             )
             return next_carry, step_out
 
-        init_carry = (rng, state, obs.astype(jnp.float32), hidden, done)
-        _, (obs_seq, act_seq, pos_seq, dir_seq, hid_seq, mask_seq) = lax.scan(
+        init_carry = (rng, state, obs.astype(jnp.float32), hidden, done, prev_action_onehot)
+        _, (obs_seq, act_seq, extras_seq, hid_seq, mask_seq) = lax.scan(
             step_fn, init_carry, None, max_len
         )
         length = mask_seq.sum(dtype=jnp.int32)
-        return obs_seq, act_seq, pos_seq, dir_seq, hid_seq, mask_seq, length
+        return obs_seq, act_seq, extras_seq, hid_seq, mask_seq, length
 
     def rollout_all_seeds(params_all_seeds, rng_keys):
         def _one_seed(params_one_seed):
@@ -139,6 +169,7 @@ def sample_and_save(
     env_name: str,
     double_critic: bool,
     memoryless: bool,
+    action_concat: bool,
 ):
     handler = get_env_handler(env_name)
     env, env_params = handler.make_raw_env()
@@ -161,10 +192,20 @@ def sample_and_save(
     params_all_seeds = jax.tree.map(lambda x: x[h_idx], ckpt["params"])
 
     n_seeds = jax.tree.leaves(params_all_seeds)[0].shape[0]
-    print(f"  checkpoint: {ckpt_path.name}, n_seeds={n_seeds}, n_traj={n_traj}, max_len={max_len}")
+    print(
+        f"  checkpoint: {ckpt_path.name}, n_seeds={n_seeds}, n_traj={n_traj}, "
+        f"max_len={max_len}, action_concat={action_concat}"
+    )
 
     # Build JIT-compiled rollout
-    rollout_fn = build_rollout_fn(model, env, env_params, hidden_size, max_len, memoryless)
+    extras_fn  = handler.get_jax_extras_fn()
+    extras_dim = handler.extras_flat_dim()
+    rollout_fn = build_rollout_fn(
+        model, env, env_params, hidden_size, max_len, memoryless,
+        extras_fn, extras_dim,
+        action_concat=action_concat,
+        action_dim=handler.action_dim(),
+    )
 
     # Same rng_keys for all seeds (same starting states, different policies)
     rng = jr.PRNGKey(seed)
@@ -172,9 +213,9 @@ def sample_and_save(
 
     print("  running vmapped rollout...", flush=True)
     rollout_out = rollout_fn(params_all_seeds, rng_keys)  # type: ignore[misc]
-    obs_j, act_j, pos_j, dir_j, hid_j, mask_j, len_j = rollout_out
-    obs_np, act_np, pos_np, dir_np, hid_np, mask_np, len_np = jax.device_get(
-        (obs_j, act_j, pos_j, dir_j, hid_j, mask_j, len_j)
+    obs_j, act_j, extras_j, hid_j, mask_j, len_j = rollout_out
+    obs_np, act_np, extras_np, hid_np, mask_np, len_np = jax.device_get(
+        (obs_j, act_j, extras_j, hid_j, mask_j, len_j)
     )
     # shapes: [n_seeds, n_traj, max_len, *] and [n_seeds, n_traj]
 
@@ -192,22 +233,20 @@ def sample_and_save(
 
     # Build NPZ payload
     payload = {
-        "obs":          obs_np.astype(np.float32),
-        "actions":      act_np,
-        "hidden":       hid_np.astype(np.float32),
-        "beliefs":      beliefs,
-        "masks":        mask_np,
-        "lengths":      len_np,
-        "belief_shape": np.array(handler.belief_shape(), dtype=np.int32),
-        "env_name":     np.array(env_name),   # stored as a 0-d string array
+        "obs":           obs_np.astype(np.float32),
+        "actions":       act_np,
+        "hidden":        hid_np.astype(np.float32),
+        "beliefs":       beliefs,
+        "masks":         mask_np,
+        "lengths":       len_np,
+        "belief_shape":  np.array(handler.belief_shape(), dtype=np.int32),
+        "env_name":      np.array(env_name),          # stored as a 0-d string array
+        "action_concat": np.array(action_concat),     # metadata: was prev_action prepended?
     }
 
-    # Env-specific extras (e.g. positions, directions for CompassWorld)
-    extras_spec = handler.extras_spec()
-    if "positions" in extras_spec:
-        payload["extras_positions"]  = pos_np
-    if "directions" in extras_spec:
-        payload["extras_directions"] = dir_np
+    # Env-specific extras: delegated to handler (e.g. positions+dir for CompassWorld,
+    # goal index for Marquee).  extras_np shape: [n_seeds, n_traj, max_len, extras_dim]
+    handler.unpack_extras(extras_np, payload)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **payload)
@@ -248,4 +287,5 @@ if __name__ == "__main__":
         env_name=str(run_args["env"]),
         double_critic=bool(run_args.get("double_critic", False)),
         memoryless=bool(run_args.get("memoryless", False)),
+        action_concat=bool(run_args.get("action_concat", False)),
     )

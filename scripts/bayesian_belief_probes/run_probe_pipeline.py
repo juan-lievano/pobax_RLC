@@ -80,15 +80,17 @@ def main():
     main_results = checkpointer.restore(run_dir)
     run_args = main_results["args"]
 
-    env_name     = str(run_args["env"])
-    hidden_size  = int(run_args["hidden_size"])
-    n_seeds      = int(run_args["n_seeds"])
+    env_name      = str(run_args["env"])
+    hidden_size   = int(run_args["hidden_size"])
+    n_seeds       = int(run_args["n_seeds"])
     double_critic = bool(run_args.get("double_critic", False))
     memoryless    = bool(run_args.get("memoryless", False))
+    action_concat = bool(run_args.get("action_concat", False))
 
     print(
         f"  env={env_name}, hidden_size={hidden_size}, "
-        f"n_seeds={n_seeds}, double_critic={double_critic}, memoryless={memoryless}"
+        f"n_seeds={n_seeds}, double_critic={double_critic}, "
+        f"memoryless={memoryless}, action_concat={action_concat}"
     )
 
     # -----------------------------------------------------------------------
@@ -125,6 +127,7 @@ def main():
                 env_name=env_name,
                 double_critic=double_critic,
                 memoryless=memoryless,
+                action_concat=action_concat,
             )
 
         # --- Step 2: train probes for each seed sequentially ---

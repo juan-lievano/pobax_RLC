@@ -258,6 +258,83 @@ def _plot_compass_triangle_grids(
 
 
 # ---------------------------------------------------------------------------
+# Marquee belief bar charts
+# ---------------------------------------------------------------------------
+
+def _plot_marquee_belief_bars(
+    records: List[dict], out_dir: Path, h_idx: int = 0
+):
+    """
+    For Marquee: plot mean predicted belief (bar chart over goals) at
+    early / mid / late checkpoints for MLP and linear probes.
+    """
+    mean_preds = aggregate_mean_pred(records)
+
+    ckpt_indices = sorted({r["checkpoint_idx"] for r in records if r["hparam_idx"] == h_idx})
+    if not ckpt_indices:
+        return
+
+    probe_rows = [p for p in ["mlp_from_rnn_hidden", "linear_from_rnn_hidden"]
+                  if any((h_idx, c, p) in mean_preds for c in ckpt_indices)]
+    if not probe_rows:
+        return
+
+    col_ckpts  = [ckpt_indices[0], ckpt_indices[len(ckpt_indices) // 2], ckpt_indices[-1]]
+    col_labels = ["Early", "Mid", "Late"]
+
+    n_rows = len(probe_rows)
+    n_cols = len(col_ckpts)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows),
+                              constrained_layout=True)
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    # Shared y-axis max for easy comparison across panels
+    all_vals = [
+        v
+        for probe in probe_rows
+        for c in col_ckpts
+        for v in (mean_preds.get((h_idx, c, probe), np.array([])).tolist())
+    ]
+    ymax = float(max(all_vals)) * 1.15 if all_vals else 1.0
+
+    env_name = records[0].get("env_name", "marquee")
+    try:
+        from envs import get_env_handler
+        handler = get_env_handler(env_name)
+    except Exception:
+        handler = None
+
+    for r_idx, probe in enumerate(probe_rows):
+        for c_idx, (c, col_label) in enumerate(zip(col_ckpts, col_labels)):
+            ax = axes[r_idx, c_idx]
+            vec = mean_preds.get((h_idx, c, probe))
+            if vec is None:
+                ax.axis("off")
+                continue
+            title = f"{PROBE_LABELS.get(probe, probe)}\n{col_label} (ckpt {c})"
+            if handler is not None:
+                handler.visualize_beliefs(vec, ax, title=title, vmax=ymax)
+            else:
+                n = len(vec)
+                ax.bar(np.arange(n), vec, color="#56B4E9", edgecolor="none")
+                ax.set_ylim(0, ymax)
+                ax.set_title(title, fontsize=9)
+                ax.spines[["right", "top"]].set_visible(False)
+
+    fig.suptitle(f"Mean Predicted Belief — {env_name}", fontsize=13)
+
+    hparams = sorted({r["hparam_idx"] for r in records})
+    suffix = f"_h{h_idx}" if len(hparams) > 1 else ""
+    out_path = out_dir / f"belief_bars{suffix}.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -279,8 +356,8 @@ def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0):
     if env_name.startswith("compass_world_"):
         _plot_compass_triangle_grids(records, results_dir, out_dir, h_idx=h_idx)
 
-    # elif env_name.startswith("marquee_"):
-    #     _plot_marquee_specific(records, out_dir, h_idx=h_idx)
+    elif env_name.startswith("marquee_"):
+        _plot_marquee_belief_bars(records, out_dir, h_idx=h_idx)
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,27 @@ class CompassWorldHandler(EnvHandler):
             "directions": (),
         }
 
+    # ------------------------------------------------------------------
+    # Generic JAX extras (positions + direction packed into a flat [3] vector)
+    # ------------------------------------------------------------------
+
+    def extras_flat_dim(self) -> int:
+        return 3  # [pos_y, pos_x, dir]
+
+    def get_jax_extras_fn(self):
+        import jax.numpy as jnp
+        def _fn(state):
+            return jnp.concatenate([
+                state.pos.astype(jnp.float32),
+                state.dir[None].astype(jnp.float32),
+            ])  # [3]
+        return _fn
+
+    def unpack_extras(self, extras_np, payload):
+        # extras_np: [n_seeds, n_traj, max_len, 3]
+        payload["extras_positions"]  = extras_np[..., :2].astype("int32")
+        payload["extras_directions"] = extras_np[..., 2].astype("int32")
+
     def compute_beliefs(
         self,
         obs_seq: np.ndarray,

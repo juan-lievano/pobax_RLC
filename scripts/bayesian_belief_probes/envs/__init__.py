@@ -11,7 +11,7 @@ To add a new env: subclass EnvHandler, implement all abstract methods,
 and register it in get_env_handler().
 """
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -48,14 +48,42 @@ class EnvHandler(ABC):
         """Structured belief tensor shape, e.g. (G, G, 4) for CompassWorld."""
         ...
 
-    @abstractmethod
     def extras_spec(self) -> dict:
         """
         Dict of {name: shape_tuple} for env-specific extras to record per step.
-        E.g. {"positions": (2,), "directions": ()} for CompassWorld.
-        Keys must be valid numpy array names (no spaces).
+        Kept for reference; the sampling pipeline uses get_jax_extras_fn /
+        extras_flat_dim / unpack_extras instead.
         """
-        ...
+        return {}
+
+    # ------------------------------------------------------------------
+    # Generic JAX extras API used by sample_trajectories.py
+    # ------------------------------------------------------------------
+
+    def extras_flat_dim(self) -> int:
+        """
+        Size of the flat extras vector returned by get_jax_extras_fn().
+        Override in subclasses that record per-step state extras.
+        """
+        return 0
+
+    def get_jax_extras_fn(self) -> Callable:
+        """
+        Returns a JAX-traceable function  state -> jnp.ndarray [extras_flat_dim]
+        that extracts env-specific extras from an env state at each step.
+        Called inside lax.scan so must be pure and JAX-compatible.
+        Default: returns an empty array (shape [0]).
+        """
+        import jax.numpy as jnp
+        return lambda state: jnp.zeros((0,), dtype=jnp.float32)
+
+    def unpack_extras(self, extras_np: np.ndarray, payload: dict) -> None:
+        """
+        Split the raw extras array  [n_seeds, n_traj, max_len, extras_flat_dim]
+        into named keys and add them to the NPZ payload dict.
+        Default: do nothing (no extras to save).
+        """
+        pass
 
     @abstractmethod
     def compute_beliefs(
@@ -101,10 +129,13 @@ def get_env_handler(env_name: str) -> EnvHandler:
         grid_size = int(env_name.split("_")[-1])
         return CompassWorldHandler(grid_size)
 
-    # Add more envs here:
-    # elif env_name.startswith("marquee_"):
-    #     from .marquee import MarqueeHandler
-    #     return MarqueeHandler(env_name)
+    elif env_name.startswith("marquee_"):
+        # env_name format: "marquee_<n_bulbs>_<n_goals>", e.g. "marquee_40_16"
+        from .marquee import MarqueeHandler
+        parts = env_name.split("_")
+        n_bulbs = int(parts[1])
+        n_goals = int(parts[2])
+        return MarqueeHandler(n_bulbs, n_goals)
 
     raise ValueError(
         f"No EnvHandler registered for env_name='{env_name}'. "
