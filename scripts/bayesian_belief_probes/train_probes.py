@@ -23,14 +23,22 @@ Output JSON structure:
       "metrics": {
           "mlp_from_rnn_hidden":       { "tv": float, "mean_kl_bits": float, ... },
           "linear_from_rnn_hidden":    { ... },
-          "trained_constant_kl":       { ... },
           "analytic_mean_constant_kl": { ... }
       },
       "mean_pred_belief": {
           "mlp_from_rnn_hidden":       [float, ...],  # shape [belief_dim]
           ...
+      },
+      "belief_sanity": {                        # only present when extras_goal_idx available
+          "final_argmax_correct":    float,    # fraction of episodes where belief[-1] argmax = true goal
+          "final_mean_prob_true":    float,    # avg P(true_goal) at the last step of each episode
+          "all_steps_mean_prob_true": float,   # avg P(true_goal) across all valid steps
       }
     }
+
+belief_sanity interpretation:
+  final_argmax_correct ≈ 1.0  -> belief computation is correct; probe failure = hidden state issue
+  final_argmax_correct ≈ 1/n_goals -> belief computation is broken
 """
 import argparse
 import json
@@ -78,13 +86,6 @@ def _init_linear(rng, in_dim: int, out_dim: int):
 def _linear_forward(params, x):
     return x @ params["w"] + params["b"]
 
-
-def _init_constant_logits(out_dim: int):
-    return {"logits": jnp.zeros((out_dim,))}
-
-
-def _constant_forward(params, x):
-    return jnp.broadcast_to(params["logits"], (x.shape[0], params["logits"].shape[0]))
 
 
 def _train_kl(init_params, apply_fn, X_train, Y_train_dist,
@@ -215,6 +216,54 @@ def _standardize(X_train, X_test, eps=1e-12):
 
 
 # ---------------------------------------------------------------------------
+# Belief sanity check (requires extras_goal_idx in NPZ)
+# ---------------------------------------------------------------------------
+
+def _check_belief_sanity(
+    beliefs: np.ndarray,    # [n_traj, max_len, belief_dim]
+    goal_idx: np.ndarray,   # [n_traj, max_len]  int32
+    lengths: np.ndarray,    # [n_traj]            int32
+) -> dict:
+    """
+    Verify that the analytical belief converges to the true goal by episode end.
+
+    Computes three scalars:
+      final_argmax_correct  – fraction of episodes where beliefs[t=-1].argmax() == true_goal
+      final_mean_prob_true  – average P(true_goal) at the final valid step of each episode
+      all_steps_mean_prob_true – average P(true_goal) over all valid (step, traj) pairs
+
+    High final_argmax_correct (>0.8) confirms belief computation is correct and that
+    probe failure reflects the hidden state, not label noise.
+    """
+    n_traj = len(lengths)
+    final_correct = 0
+    final_prob_true: list = []
+    all_prob_true: list = []
+
+    for i in range(n_traj):
+        l = int(lengths[i])
+        if l <= 0:
+            continue
+        for t in range(l):
+            tg = int(goal_idx[i, t])
+            all_prob_true.append(float(beliefs[i, t, tg]))
+        # Final step: last belief recorded by compute_beliefs = beliefs[l-1]
+        # (posterior incorporating flips 0..l-2; see compute_beliefs docstring)
+        tg_final = int(goal_idx[i, l - 1])
+        p_true = float(beliefs[i, l - 1, tg_final])
+        final_prob_true.append(p_true)
+        if int(np.argmax(beliefs[i, l - 1])) == tg_final:
+            final_correct += 1
+
+    n_eps = len(final_prob_true)
+    return {
+        "final_argmax_correct":     float(final_correct / n_eps) if n_eps > 0 else float("nan"),
+        "final_mean_prob_true":     float(np.mean(final_prob_true)) if final_prob_true else float("nan"),
+        "all_steps_mean_prob_true": float(np.mean(all_prob_true)) if all_prob_true else float("nan"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -248,10 +297,23 @@ def train_and_save(
     hidden  = data["hidden"][seed_idx]    # [n_traj, max_len, H]
     beliefs = data["beliefs"][seed_idx]   # [n_traj, max_len, belief_dim]
     masks   = data["masks"][seed_idx]     # [n_traj, max_len]
+    lengths = data["lengths"][seed_idx]   # [n_traj]
 
     # Read env_name from metadata stored in the NPZ (written by sample_trajectories)
     # env_name is stored as a scalar string array; fall back to "" if missing.
     env_name = str(data.get("env_name", np.array("")))
+
+    # Belief sanity check: does the analytical belief converge to the true goal?
+    # Requires extras_goal_idx (available for Marquee, not CompassWorld).
+    belief_sanity = None
+    if "extras_goal_idx" in data:
+        goal_idx = data["extras_goal_idx"][seed_idx]  # [n_traj, max_len]
+        belief_sanity = _check_belief_sanity(beliefs, goal_idx, lengths)
+        print(
+            f"  belief sanity: final_argmax_correct={belief_sanity['final_argmax_correct']:.3f}  "
+            f"final_mean_prob_true={belief_sanity['final_mean_prob_true']:.3f}  "
+            f"all_steps_mean_prob_true={belief_sanity['all_steps_mean_prob_true']:.3f}"
+        )
 
     n_traj, max_len, hidden_size = hidden.shape
     belief_dim = beliefs.shape[-1]
@@ -308,24 +370,11 @@ def train_and_save(
                             lr=linear_lr, weight_decay=linear_weight_decay,
                             epochs=epochs, batch_size=batch_size, eps=eps)
 
-    print("    training constant KL probe...", flush=True)
-    rng, k = jax.random.split(rng)
-    dummy_X = np.zeros((X_train_std.shape[0], 1), dtype=np.float32)
-    const_params = _init_constant_logits(out_dim)
-    const_params = _train_kl(const_params, _constant_forward, dummy_X, Y_train_dist,
-                              lr=1e-2, weight_decay=0.0,
-                              epochs=epochs, batch_size=batch_size, eps=eps)
-    const_probs = np.asarray(jax.nn.softmax(const_params["logits"]), dtype=np.float64)
-    const_probs = np.clip(const_probs, eps, None)
-    const_probs /= const_probs.sum()
-
     # Predictions on test set
     def _pred_mlp(X):
         return _predict(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
     def _pred_lin(X):
         return _predict(_linear_forward, lin_params, X, h_mean, h_std, eps)
-    def _pred_const(X):
-        return np.tile(const_probs, (X.shape[0], 1))
     def _pred_kl_opt(X):
         p = np.clip(kl_opt_constant, eps, None); p /= p.sum()
         return np.tile(p, (X.shape[0], 1))
@@ -334,7 +383,6 @@ def train_and_save(
     metrics = {
         "mlp_from_rnn_hidden":       _evaluate_metrics(_pred_mlp(X_test_std),  Y_test, tol, eps),
         "linear_from_rnn_hidden":    _evaluate_metrics(_pred_lin(X_test_std),  Y_test, tol, eps),
-        "trained_constant_kl":       _evaluate_metrics(_pred_const(X_test_std), Y_test, tol, eps),
         "analytic_mean_constant_kl": _evaluate_metrics(_pred_kl_opt(X_test_std), Y_test, tol, eps),
     }
 
@@ -342,19 +390,21 @@ def train_and_save(
     mean_pred_belief = {
         "mlp_from_rnn_hidden":       _pred_mlp(X_test_std).mean(axis=0).tolist(),
         "linear_from_rnn_hidden":    _pred_lin(X_test_std).mean(axis=0).tolist(),
-        "trained_constant_kl":       const_probs.tolist(),
         "analytic_mean_constant_kl": (kl_opt_constant / kl_opt_constant.sum()).tolist(),
     }
 
     result = {
-        "checkpoint_idx":  checkpoint_idx,
-        "hparam_idx":      hparam_idx,
-        "seed_idx":        seed_idx,
-        "env_name":        env_name,
-        "hidden_size":     hidden_size,
-        "belief_dim":      belief_dim,
-        "metrics":         metrics,
+        "checkpoint_idx":   checkpoint_idx,
+        "hparam_idx":       hparam_idx,
+        "seed_idx":         seed_idx,
+        "env_name":         env_name,
+        "hidden_size":      hidden_size,
+        "belief_dim":       belief_dim,
+        "metrics":          metrics,
         "mean_pred_belief": mean_pred_belief,
+        # Only present when extras_goal_idx is available in the NPZ (e.g. Marquee).
+        # None for envs that don't expose the true goal index (e.g. CompassWorld).
+        **({"belief_sanity": belief_sanity} if belief_sanity is not None else {}),
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)

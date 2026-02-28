@@ -128,6 +128,7 @@ def main():
                 double_critic=double_critic,
                 memoryless=memoryless,
                 action_concat=action_concat,
+                env_seed=int(run_args["seed"]),
             )
 
         # --- Step 2: train probes for each seed sequentially ---

@@ -108,9 +108,11 @@ def build_rollout_fn(
             hidden_rec = jnp.where(done, hidden, hidden_new)
             mask_out   = jnp.logical_not(done)
 
-            next_obs, next_state, _, next_done, _ = env.step_env(
+            next_obs, next_state, reward, next_done, _ = env.step_env(
                 k_step, state, action, env_params
             )
+            # Freeze reward to 0 after episode ends (consistent with obs/hidden freeze)
+            reward_rec = jnp.where(done, jnp.zeros_like(reward), reward)
             next_done_flag = jnp.logical_or(done, next_done)
 
             # One-hot of current action becomes prev_action for the next step.
@@ -134,15 +136,16 @@ def build_rollout_fn(
                 extras_fn(state),  # [extras_dim]     env-specific extras
                 hidden_rec[0],     # [hidden_size]    squeeze batch dim for storage
                 mask_out,          # []               validity mask
+                reward_rec,        # []               per-step reward (0 after episode ends)
             )
             return next_carry, step_out
 
         init_carry = (rng, state, obs.astype(jnp.float32), hidden, done, prev_action_onehot)
-        _, (obs_seq, act_seq, extras_seq, hid_seq, mask_seq) = lax.scan(
+        _, (obs_seq, act_seq, extras_seq, hid_seq, mask_seq, rew_seq) = lax.scan(
             step_fn, init_carry, None, max_len
         )
         length = mask_seq.sum(dtype=jnp.int32)
-        return obs_seq, act_seq, extras_seq, hid_seq, mask_seq, length
+        return obs_seq, act_seq, extras_seq, hid_seq, mask_seq, length, rew_seq
 
     def rollout_all_seeds(params_all_seeds, rng_keys):
         def _one_seed(params_one_seed):
@@ -170,8 +173,9 @@ def sample_and_save(
     double_critic: bool,
     memoryless: bool,
     action_concat: bool,
+    env_seed: int = 0,
 ):
-    handler = get_env_handler(env_name)
+    handler = get_env_handler(env_name, seed=env_seed)
     env, env_params = handler.make_raw_env()
 
     # Build model (structure must match the training run)
@@ -213,9 +217,9 @@ def sample_and_save(
 
     print("  running vmapped rollout...", flush=True)
     rollout_out = rollout_fn(params_all_seeds, rng_keys)  # type: ignore[misc]
-    obs_j, act_j, extras_j, hid_j, mask_j, len_j = rollout_out
-    obs_np, act_np, extras_np, hid_np, mask_np, len_np = jax.device_get(
-        (obs_j, act_j, extras_j, hid_j, mask_j, len_j)
+    obs_j, act_j, extras_j, hid_j, mask_j, len_j, rew_j = rollout_out
+    obs_np, act_np, extras_np, hid_np, mask_np, len_np, rew_np = jax.device_get(
+        (obs_j, act_j, extras_j, hid_j, mask_j, len_j, rew_j)
     )
     # shapes: [n_seeds, n_traj, max_len, *] and [n_seeds, n_traj]
 
@@ -239,6 +243,7 @@ def sample_and_save(
         "beliefs":       beliefs,
         "masks":         mask_np,
         "lengths":       len_np,
+        "rewards":       rew_np.astype(np.float32),   # [n_seeds, n_traj, max_len]
         "belief_shape":  np.array(handler.belief_shape(), dtype=np.int32),
         "env_name":      np.array(env_name),          # stored as a 0-d string array
         "action_concat": np.array(action_concat),     # metadata: was prev_action prepended?

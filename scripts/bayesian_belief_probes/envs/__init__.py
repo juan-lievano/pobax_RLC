@@ -122,8 +122,18 @@ class EnvHandler(ABC):
         )
 
 
-def get_env_handler(env_name: str) -> EnvHandler:
-    """Return the appropriate EnvHandler for the given env_name."""
+def get_env_handler(env_name: str, seed: int = 0) -> EnvHandler:
+    """Return the appropriate EnvHandler for the given env_name.
+
+    Parameters
+    ----------
+    env_name : str
+        Full environment name string, e.g. 'compass_world_8' or 'rocksample_11_11'.
+    seed : int
+        Training seed from run_args["seed"].  Only used by environments whose
+        construction is seeded (currently RockSample, whose rock positions are
+        determined by the same key derivation used in ppo.py:make_train).
+    """
     if env_name.startswith("compass_world_"):
         from .compass_world import CompassWorldHandler
         grid_size = int(env_name.split("_")[-1])
@@ -136,6 +146,14 @@ def get_env_handler(env_name: str) -> EnvHandler:
         n_bulbs = int(parts[1])
         n_goals = int(parts[2])
         return MarqueeHandler(n_bulbs, n_goals)
+
+    elif env_name.startswith("rocksample_"):
+        # env_name format: "rocksample_<size>_<n_rocks>", e.g. "rocksample_11_11"
+        from .rocksample import RockSampleHandler
+        parts = env_name.split("_")
+        size = int(parts[1])
+        n_rocks = int(parts[2])
+        return RockSampleHandler(size, n_rocks, seed=seed)
 
     raise ValueError(
         f"No EnvHandler registered for env_name='{env_name}'. "

@@ -39,14 +39,12 @@ from envs import get_env_handler
 PROBE_ORDER = [
     "mlp_from_rnn_hidden",
     "linear_from_rnn_hidden",
-    "trained_constant_kl",
     "analytic_mean_constant_kl",
 ]
 
 PROBE_LABELS = {
     "mlp_from_rnn_hidden":       "MLP (RNN hidden)",
     "linear_from_rnn_hidden":    "Linear (RNN hidden)",
-    "trained_constant_kl":       "Trained Constant (KL)",
     "analytic_mean_constant_kl": "Analytic Mean Constant",
 }
 
@@ -335,6 +333,132 @@ def _plot_marquee_belief_bars(
 
 
 # ---------------------------------------------------------------------------
+# Belief sanity curves (Marquee / envs with extras_goal_idx)
+# ---------------------------------------------------------------------------
+
+def plot_belief_sanity_curves(records: List[dict], out_dir: Path, h_idx: int = 0):
+    """
+    Plot belief sanity metrics vs checkpoint index.
+
+    Three lines:
+      - final_argmax_correct:    fraction of episodes where belief[-1] argmax = true goal
+      - final_mean_prob_true:    avg P(true_goal) at the final step
+      - all_steps_mean_prob_true: avg P(true_goal) across all valid steps
+
+    A value near 1.0 for final_argmax_correct confirms the analytical belief
+    computation is correct; probe failure then reflects the hidden state.
+    """
+    # Only records that contain belief_sanity (i.e. Marquee-like envs)
+    sane_records = [r for r in records if "belief_sanity" in r and r["hparam_idx"] == h_idx]
+    if not sane_records:
+        return
+
+    ckpt_indices = sorted({r["checkpoint_idx"] for r in sane_records})
+
+    keys = ["final_argmax_correct", "final_mean_prob_true", "all_steps_mean_prob_true"]
+    labels = {
+        "final_argmax_correct":     "Final argmax correct ↑",
+        "final_mean_prob_true":     "Final mean P(true goal) ↑",
+        "all_steps_mean_prob_true": "All-steps mean P(true goal) ↑",
+    }
+    colors = ["#0072B2", "#E69F00", "#009E73"]
+
+    fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+
+    for key, color in zip(keys, colors):
+        xs, means, stds = [], [], []
+        for c in ckpt_indices:
+            vals = [r["belief_sanity"][key] for r in sane_records
+                    if r["checkpoint_idx"] == c and key in r["belief_sanity"]
+                    and r["belief_sanity"][key] == r["belief_sanity"][key]]  # drop NaN
+            if not vals:
+                continue
+            xs.append(c)
+            means.append(float(np.mean(vals)))
+            stds.append(float(np.std(vals)) if len(vals) > 1 else 0.0)
+
+        if not xs:
+            continue
+        xs_arr = np.array(xs)
+        m_arr  = np.array(means)
+        s_arr  = np.array(stds)
+        ax.plot(xs_arr, m_arr, color=color, linewidth=2, label=labels[key])
+        ax.fill_between(xs_arr, m_arr - s_arr, m_arr + s_arr, color=color, alpha=0.2)
+
+    ax.set_ylim(0, 1.05)
+    ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_xlabel("Checkpoint index")
+    ax.set_ylabel("Fraction / probability")
+    ax.set_title("Belief Sanity Check (analytical beliefs vs true goal)")
+    ax.spines[["right", "top"]].set_visible(False)
+    ax.legend(fontsize=9)
+
+    suffix = f"_h{h_idx}"
+    out_path = out_dir / f"belief_sanity{suffix}.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Episodic reward curve
+# ---------------------------------------------------------------------------
+
+def plot_reward_curves(results_dir: Path, out_dir: Path, h_idx: int = 0):
+    """
+    For each checkpoint, load the NPZ and compute mean episodic return
+    (sum of per-step rewards per trajectory, averaged over trajectories and
+    then reported as mean ± std across seeds).  Saves reward_curve[_h{h}].png.
+    """
+    ckpt_dirs = sorted(
+        [d for d in results_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint_")],
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+
+    xs, means, stds = [], [], []
+    for ckpt_dir in ckpt_dirs:
+        ckpt_idx = int(ckpt_dir.name.split("_")[1])
+        npz_path = ckpt_dir / f"h{h_idx}_trajectories.npz"
+        if not npz_path.exists():
+            continue
+        data = np.load(npz_path, allow_pickle=False)
+        if "rewards" not in data:
+            continue
+        rewards = data["rewards"]  # [n_seeds, n_traj, max_len]
+        masks   = data["masks"]    # [n_seeds, n_traj, max_len]
+        # Episodic return = sum of rewards over valid steps per trajectory
+        ep_returns  = (rewards * masks).sum(axis=-1)  # [n_seeds, n_traj]
+        seed_means  = ep_returns.mean(axis=1)          # [n_seeds]
+        xs.append(ckpt_idx)
+        means.append(float(seed_means.mean()))
+        stds.append(float(seed_means.std()) if len(seed_means) > 1 else 0.0)
+
+    if not xs:
+        print("  no reward data found in NPZs — skipping reward curve")
+        return
+
+    xs_arr = np.array(xs)
+    m_arr  = np.array(means)
+    s_arr  = np.array(stds)
+
+    fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+    ax.plot(xs_arr, m_arr, color="#0072B2", linewidth=2)
+    ax.fill_between(xs_arr, m_arr - s_arr, m_arr + s_arr, color="#0072B2", alpha=0.2,
+                    label="±1 std (seeds)")
+    ax.set_xlabel("Checkpoint index")
+    ax.set_ylabel("Average episodic return")
+    ax.set_title("Average Episodic Return per Checkpoint")
+    ax.spines[["right", "top"]].set_visible(False)
+    ax.legend(fontsize=9)
+
+    suffix = f"_h{h_idx}"
+    out_path = out_dir / f"reward_curve{suffix}.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -351,6 +475,12 @@ def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0):
 
     # --- Generic metric curves (always) ---
     plot_metric_curves(records, out_dir, h_idx=h_idx)
+
+    # --- Belief sanity curves (when extras_goal_idx is in the NPZ, e.g. Marquee) ---
+    plot_belief_sanity_curves(records, out_dir, h_idx=h_idx)
+
+    # --- Episodic reward curve (always, when NPZs contain rewards) ---
+    plot_reward_curves(results_dir, out_dir, h_idx=h_idx)
 
     # --- Env-specific visualizations ---
     if env_name.startswith("compass_world_"):
