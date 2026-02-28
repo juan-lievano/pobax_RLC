@@ -103,9 +103,11 @@ class MarqueeHandler(EnvHandler):
         """
         Compute the analytical posterior over goals for one trajectory.
 
-        The belief at step t is computed AFTER using the transition
-        (obs_t → obs_{t+1}) with action_t to observe what the human did.
-        This matches the online posterior recorded during trajectory sampling.
+        The belief at step t is the posterior BEFORE the transition at step t,
+        i.e. after incorporating human flips 0..t-1.  This aligns with
+        hidden[t], which has seen obs[0..t] and can infer flips 0..t-1
+        (from deltas obs[0]→obs[1], ..., obs[t-1]→obs[t]) but not flip t
+        (which requires obs[t+1], not yet seen at step t).
 
         Args:
             obs_seq:    [max_len, n_bulbs]  bulb array at each step
@@ -124,8 +126,13 @@ class MarqueeHandler(EnvHandler):
         post = self._prior_np.copy()
 
         for t in range(length):
+            # Record the posterior BEFORE the transition at step t.
+            # hidden[t] has seen obs[0..t], from which it can infer human flips
+            # 0..t-1 (i.e. transitions 0..t-1).  beliefs[t] must match that.
+            beliefs[t] = post.astype(np.float32)
             if t + 1 < max_len:
-                # Use the transition obs[t] → obs[t+1] with action[t]
+                # Update using the transition obs[t] → obs[t+1] with action[t].
+                # The result becomes beliefs[t+1] (seen by hidden[t+1]).
                 post = _update_posterior_np(
                     self._goals_np,
                     post,
@@ -133,9 +140,6 @@ class MarqueeHandler(EnvHandler):
                     obs_seq[t + 1].astype(np.float64),
                     int(action_seq[t]),
                 )
-            # At t == length-1 with length == max_len: no next obs available,
-            # keep current posterior (minor approximation for truncated episodes).
-            beliefs[t] = post.astype(np.float32)
 
         return beliefs
 
