@@ -8,12 +8,17 @@ For each checkpoint in the run directory:
 
 Usage:
     python run_probe_pipeline.py \\
-        --run_dir  results/my_exp/compass_world_8_seed(42)_time(...) \\
+        --run_dir  results/rocksample_11_11_h256_dc_ac_5M \\
         --n_traj   500 \\
         --max_len  200 \\
-        --out_dir  probe_results/my_exp \\
+        [--out_dir probe_results/my_exp] \\
         [--h_idx 0] \\
         [--force]
+
+--run_dir can point either directly to the timestamped run directory
+(e.g. results/.../rocksample_11_11_seed(2026)_time(...)) or to its
+parent directory.  If the parent contains exactly one subdirectory it
+is resolved automatically, so you never have to copy the hash string.
 """
 import argparse
 import sys
@@ -26,6 +31,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sample_trajectories import sample_and_save
 from train_probes import train_and_save
 from visualize import visualize_results
+
+
+def _resolve_run_dir(path: Path) -> Path:
+    """Accept either the timestamped run dir or its parent.
+
+    If `path` directly contains checkpoint_* subdirs it is returned as-is.
+    Otherwise, if it contains exactly one subdirectory, that child is
+    returned (the common case where the parent is the experiment folder and
+    the child is the single seed/time-stamped run inside it).
+    """
+    if any(d.is_dir() and d.name.startswith("checkpoint_") for d in path.iterdir()):
+        return path
+    subdirs = [d for d in path.iterdir() if d.is_dir()]
+    if len(subdirs) == 1:
+        print(f"  auto-resolved run_dir → {subdirs[0]}")
+        return subdirs[0]
+    if len(subdirs) == 0:
+        raise FileNotFoundError(f"No subdirectories found in {path}")
+    names = "\n  ".join(d.name for d in sorted(subdirs))
+    raise ValueError(
+        f"{path} contains {len(subdirs)} subdirectories; pass the specific one:\n  {names}"
+    )
 
 
 def _discover_checkpoints(run_dir: Path):
@@ -47,8 +74,9 @@ def main():
                    help="Number of trajectories to sample per checkpoint per seed.")
     p.add_argument("--max_len",  type=int, default=200,
                    help="Maximum steps per trajectory (default 200).")
-    p.add_argument("--out_dir",  required=True, type=Path,
-                   help="Root directory for probe pipeline outputs.")
+    p.add_argument("--out_dir",  type=Path, default=None,
+                   help="Root directory for probe pipeline outputs. "
+                        "Defaults to probe_results/<parent-dir-of-run_dir>.")
     p.add_argument("--h_idx",   type=int, default=0,
                    help="Hparam index to use (default 0).")
     p.add_argument("--seed",    type=int, default=0,
@@ -68,8 +96,11 @@ def main():
                         "checkpoints. If omitted, all valid training rows are used.")
     args = p.parse_args()
 
-    run_dir = args.run_dir.resolve()
-    out_dir = args.out_dir.resolve()
+    raw_dir = args.run_dir.resolve()
+    # out_dir is derived from the path the user typed (before auto-resolution),
+    # so it stays clean even when we descend into a timestamped child.
+    out_dir = (args.out_dir or Path("probe_results") / raw_dir.name).resolve()
+    run_dir = _resolve_run_dir(raw_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------

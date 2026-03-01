@@ -245,8 +245,9 @@ def sample_and_save(
         "lengths":       len_np,
         "rewards":       rew_np.astype(np.float32),   # [n_seeds, n_traj, max_len]
         "belief_shape":  np.array(handler.belief_shape(), dtype=np.int32),
-        "env_name":      np.array(env_name),          # stored as a 0-d string array
-        "action_concat": np.array(action_concat),     # metadata: was prev_action prepended?
+        "env_name":      np.array(env_name),            # stored as a 0-d string array
+        "action_concat": np.array(action_concat),       # metadata: was prev_action prepended?
+        "belief_type":   np.array(handler.belief_type()),  # "categorical" or "bernoulli"
     }
 
     # Env-specific extras: delegated to handler (e.g. positions+dir for CompassWorld,

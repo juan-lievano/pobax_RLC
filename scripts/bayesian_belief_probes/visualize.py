@@ -60,6 +60,16 @@ METRIC_KEYS = [
     "argmax_match_rate",
     "mean_prob_on_true_location",
 ]
+# RockSample uses factored Bernoulli beliefs; "should-know" is defined per
+# (step, rock) pair rather than over the full joint state.  Most certain pairs
+# come from sample actions (p=0 mechanically), so argmax_match and
+# impossible_mass_should_know are near-perfect across all checkpoints and
+# carry no information about learning.  Show only the all-pairs metrics.
+METRIC_KEYS_ROCKSAMPLE = [
+    "tv",
+    "mean_kl_bits",
+    "impossible_mass_overall",
+]
 METRIC_TITLES = {
     "tv":                          "Total Variation ↓",
     "mean_kl_bits":                "Mean KL (bits) ↓",
@@ -116,7 +126,8 @@ def aggregate_mean_pred(records: List[dict]) -> Dict:
 # Metric curves
 # ---------------------------------------------------------------------------
 
-def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0):
+def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0,
+                       metric_keys: list = METRIC_KEYS):
     grouped = aggregate(records)
 
     ckpt_indices = sorted({r["checkpoint_idx"] for r in records})
@@ -128,10 +139,17 @@ def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0):
     hparams = sorted({r["hparam_idx"] for r in records})
 
     for h in hparams:
-        fig, axes = plt.subplots(2, 3, figsize=(14, 7), constrained_layout=True)
-        axes_flat = axes.ravel()
+        n_metrics = len(metric_keys)
+        n_cols = min(3, n_metrics)
+        n_rows = (n_metrics + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(14 * n_cols / 3, 7 * n_rows / 2),
+                                 constrained_layout=True)
+        axes_flat = np.array(axes).ravel()
+        # Hide any unused subplot slots
+        for ax in axes_flat[n_metrics:]:
+            ax.axis("off")
 
-        for ax, metric in zip(axes_flat, METRIC_KEYS):
+        for ax, metric in zip(axes_flat, metric_keys):
             for probe in probes:
                 means, stds, xs = [], [], []
                 for c in ckpt_indices:
@@ -473,8 +491,13 @@ def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0):
     env_name = records[0].get("env_name", "")
     print(f"  found {len(records)} JSON records, env='{env_name}'")
 
+    metric_keys = (
+        METRIC_KEYS_ROCKSAMPLE if env_name.startswith("rocksample_")
+        else METRIC_KEYS
+    )
+
     # --- Generic metric curves (always) ---
-    plot_metric_curves(records, out_dir, h_idx=h_idx)
+    plot_metric_curves(records, out_dir, h_idx=h_idx, metric_keys=metric_keys)
 
     # --- Belief sanity curves (when extras_goal_idx is in the NPZ, e.g. Marquee) ---
     plot_belief_sanity_curves(records, out_dir, h_idx=h_idx)

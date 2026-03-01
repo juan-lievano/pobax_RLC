@@ -99,6 +99,9 @@ class RockSampleHandler(EnvHandler):
     def action_dim(self) -> int:
         return self.n_rocks + 5
 
+    def belief_type(self) -> str:
+        return "bernoulli"
+
     def belief_dim(self) -> int:
         return self.n_rocks
 

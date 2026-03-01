@@ -88,6 +88,42 @@ def _linear_forward(params, x):
 
 
 
+def _train_bce(init_params, apply_fn, X_train, Y_train,
+               lr=1e-3, weight_decay=0.0, epochs=80, batch_size=1024):
+    """BCE loss + sigmoid output for K independent Bernoulli beliefs."""
+    X_train = np.asarray(X_train, dtype=np.float32)
+    Y_train = np.asarray(Y_train, dtype=np.float32)
+    n = X_train.shape[0]
+    if n == 0:
+        return init_params
+
+    opt = optax.adamw(lr, weight_decay=weight_decay)
+    params = init_params
+    opt_state = opt.init(params)
+
+    @jax.jit
+    def step(p, s, x, y):
+        def loss_fn(params):
+            logits = apply_fn(params, x)
+            return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, y))
+        grads = jax.grad(loss_fn)(p)
+        updates, new_s = opt.update(grads, s, p)
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_s
+
+    rng = np.random.default_rng(0)
+    for epoch in range(epochs):
+        perm = rng.permutation(n)
+        for i in range(0, n, batch_size):
+            idx = perm[i : i + batch_size]
+            params, opt_state = step(
+                params, opt_state,
+                jnp.asarray(X_train[idx]),
+                jnp.asarray(Y_train[idx]),
+            )
+    return params
+
+
 def _train_kl(init_params, apply_fn, X_train, Y_train_dist,
                lr=1e-3, weight_decay=0.0, epochs=80, batch_size=1024, eps=1e-12):
     X_train = np.asarray(X_train, dtype=np.float32)
@@ -135,6 +171,14 @@ def _predict(apply_fn, params, X_std, input_mean, input_std, eps=1e-12):
     return probs
 
 
+def _predict_bernoulli(apply_fn, params, X_raw, input_mean, input_std, eps=1e-12):
+    """Sigmoid output for K independent Bernoulli beliefs."""
+    X = (np.asarray(X_raw, dtype=np.float32) - input_mean) / input_std
+    logits = apply_fn(params, jnp.asarray(X))
+    probs = np.asarray(jax.nn.sigmoid(logits), dtype=np.float64)
+    return np.clip(probs, eps, 1.0 - eps)
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -175,6 +219,77 @@ def _evaluate_metrics(Y_pred, Y_true, tol=1e-9, eps=1e-12):
         "tv":                           tv,
         "mean_kl_bits":                 mean_kl_bits,
         "should_know_frac":             k_frac,
+        "argmax_match_rate":            argmax_match,
+        "mean_prob_on_true_location":   mean_prob_true,
+        "impossible_mass_overall":      imp_overall,
+        "impossible_mass_should_know":  imp_sk,
+    }
+
+
+def _evaluate_bernoulli_metrics(Y_pred, Y_true, tol=1e-9, eps=1e-12):
+    """
+    Metrics for K independent Bernoulli beliefs.
+
+    Y_pred, Y_true: [N, K]  float64 values in (0, 1).
+    All per-element metrics are averaged over (N*K) elements.
+
+    Uses the same key names as _evaluate_metrics so the visualizer
+    can plot both categorical and Bernoulli runs without changes.
+    """
+    # Y_pred comes from sigmoid so is theoretically in (0,1), but extreme logits
+    # can produce exact 0/1 in floating point. Clip to prevent log2(0) = -inf
+    # when the probe is maximally wrong.  beliefs (Y_true) are float32 from the
+    # NPZ; cast to float64 so subsequent log2 calls are numerically correct.
+    Y_pred = np.clip(np.asarray(Y_pred, dtype=np.float64), eps, 1.0 - eps)
+    Y_true = np.asarray(Y_true, dtype=np.float64)
+
+    # TV: mean absolute error per element (= component-wise TV of Bernoulli)
+    tv = float(np.mean(np.abs(Y_true - Y_pred)))
+
+    # KL(Bern(p_true) || Bern(p_pred)) in bits per element.
+    # Mathematical convention: 0 * log2(0 / q) = 0.
+    # We implement this with np.where masking so log2 is never called with 0,
+    # rather than clipping p_true away from 0/1 (which would distort the metric).
+    p, q = Y_true, Y_pred
+    kl_elem = (
+        np.where(p > 0, p * (np.log2(np.where(p > 0, p, 1.0)) - np.log2(q)), 0.0)
+        + np.where(p < 1, (1.0 - p) * (np.log2(np.where(p < 1, 1.0 - p, 1.0)) - np.log2(1.0 - q)), 0.0)
+    )
+    mean_kl_bits = float(np.mean(kl_elem))
+
+    # "Should know": (step, rock) pairs where p_true is exactly 0 or 1.
+    # This happens after sampling (p=0) or a distance-0 check (p=0 or 1).
+    certain = (Y_true <= tol) | (Y_true >= 1.0 - tol)
+    certain_frac = float(certain.mean())
+
+    # Impossible mass: prob assigned to the genuinely impossible morality.
+    # For certain pairs only — uncertain pairs contribute 0 (no morality is impossible).
+    #   p_true = 0 (rock definitely bad):  impossible = p_pred  (prob of "good")
+    #   p_true = 1 (rock definitely good): impossible = 1-p_pred (prob of "bad")
+    #   0 < p_true < 1 (uncertain):        impossible = 0
+    impossible_prob = np.where(
+        Y_true <= tol,       Y_pred,
+        np.where(Y_true >= 1.0 - tol, 1.0 - Y_pred, 0.0)
+    )
+    imp_overall = float(impossible_prob.mean())  # averaged over ALL (step, rock) pairs
+
+    if certain.any():
+        pred_side = Y_pred >= 0.5
+        true_side = Y_true >= 0.5
+        argmax_match = float(np.mean(pred_side[certain] == true_side[certain]))
+        # Prob assigned to the true morality for certain pairs
+        prob_correct_side = np.where(Y_true >= 0.5, Y_pred, 1.0 - Y_pred)
+        mean_prob_true = float(np.mean(prob_correct_side[certain]))
+        imp_sk = float(impossible_prob[certain].mean())
+    else:
+        argmax_match = float("nan")
+        mean_prob_true = float("nan")
+        imp_sk = float("nan")
+
+    return {
+        "tv":                           tv,
+        "mean_kl_bits":                 mean_kl_bits,
+        "should_know_frac":             certain_frac,
         "argmax_match_rate":            argmax_match,
         "mean_prob_on_true_location":   mean_prob_true,
         "impossible_mass_overall":      imp_overall,
@@ -299,9 +414,14 @@ def train_and_save(
     masks   = data["masks"][seed_idx]     # [n_traj, max_len]
     lengths = data["lengths"][seed_idx]   # [n_traj]
 
-    # Read env_name from metadata stored in the NPZ (written by sample_trajectories)
-    # env_name is stored as a scalar string array; fall back to "" if missing.
-    env_name = str(data.get("env_name", np.array("")))
+    # Read env_name and belief_type from NPZ metadata.
+    # Fall back to "" / "categorical" for NPZs written before these keys were added.
+    env_name    = str(data.get("env_name",    np.array("")))
+    belief_type = str(data.get("belief_type", np.array("categorical")))
+    # Backward compat: infer belief_type from env_name for NPZs missing the key.
+    # TODO: remove this patch once all NPZs have been re-sampled with belief_type stored.
+    if belief_type == "categorical" and env_name.startswith("rocksample_"):
+        belief_type = "bernoulli"
 
     # Belief sanity check: does the analytical belief converge to the true goal?
     # Requires extras_goal_idx (available for Marquee, not CompassWorld).
@@ -345,53 +465,96 @@ def train_and_save(
 
     X_train_std, X_test_std, h_mean, h_std = _standardize(X_train, X_test, eps)
 
-    # Normalized train distribution for KL loss
-    Y_train_dist = np.clip(Y_train, eps, None)
-    Y_train_dist /= Y_train_dist.sum(axis=1, keepdims=True)
-
-    # Analytic mean constant: mean of training beliefs
-    kl_opt_constant = Y_train_dist.mean(axis=0)
-
     rng = jax.random.PRNGKey(0)
     out_dim = belief_dim
     in_dim  = hidden_size
 
-    print("    training MLP probe...", flush=True)
-    rng, k = jax.random.split(rng)
-    mlp_params = _init_mlp(k, in_dim, mlp_hidden_layers, out_dim)
-    mlp_params = _train_kl(mlp_params, _mlp_forward, X_train_std, Y_train_dist,
-                            lr=mlp_lr, weight_decay=mlp_weight_decay,
-                            epochs=epochs, batch_size=batch_size, eps=eps)
+    if belief_type == "bernoulli":
+        # -----------------------------------------------------------------
+        # Bernoulli pipeline: BCE loss + sigmoid, per-element metrics
+        # -----------------------------------------------------------------
+        print(f"    [bernoulli] training MLP probe...", flush=True)
+        rng, k = jax.random.split(rng)
+        mlp_params = _init_mlp(k, in_dim, mlp_hidden_layers, out_dim)
+        mlp_params = _train_bce(mlp_params, _mlp_forward, X_train_std, Y_train,
+                                lr=mlp_lr, weight_decay=mlp_weight_decay,
+                                epochs=epochs, batch_size=batch_size)
 
-    print("    training linear probe...", flush=True)
-    rng, k = jax.random.split(rng)
-    lin_params = _init_linear(k, in_dim, out_dim)
-    lin_params = _train_kl(lin_params, _linear_forward, X_train_std, Y_train_dist,
-                            lr=linear_lr, weight_decay=linear_weight_decay,
-                            epochs=epochs, batch_size=batch_size, eps=eps)
+        print(f"    [bernoulli] training linear probe...", flush=True)
+        rng, k = jax.random.split(rng)
+        lin_params = _init_linear(k, in_dim, out_dim)
+        lin_params = _train_bce(lin_params, _linear_forward, X_train_std, Y_train,
+                                lr=linear_lr, weight_decay=linear_weight_decay,
+                                epochs=epochs, batch_size=batch_size)
 
-    # Predictions on test set
-    def _pred_mlp(X):
-        return _predict(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
-    def _pred_lin(X):
-        return _predict(_linear_forward, lin_params, X, h_mean, h_std, eps)
-    def _pred_kl_opt(X):
-        p = np.clip(kl_opt_constant, eps, None); p /= p.sum()
-        return np.tile(p, (X.shape[0], 1))
+        def _pred_mlp(X):
+            return _predict_bernoulli(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
+        def _pred_lin(X):
+            return _predict_bernoulli(_linear_forward, lin_params, X, h_mean, h_std, eps)
 
-    print("    evaluating metrics...", flush=True)
-    metrics = {
-        "mlp_from_rnn_hidden":       _evaluate_metrics(_pred_mlp(X_test_std),  Y_test, tol, eps),
-        "linear_from_rnn_hidden":    _evaluate_metrics(_pred_lin(X_test_std),  Y_test, tol, eps),
-        "analytic_mean_constant_kl": _evaluate_metrics(_pred_kl_opt(X_test_std), Y_test, tol, eps),
-    }
+        # Constant baseline: mean p_i over training set for each rock
+        bce_constant = Y_train.mean(axis=0)
+        def _pred_bce_const(X):
+            return np.tile(bce_constant, (X.shape[0], 1))
 
-    # Mean predicted belief on the test set (for triangle grids in visualize.py)
-    mean_pred_belief = {
-        "mlp_from_rnn_hidden":       _pred_mlp(X_test_std).mean(axis=0).tolist(),
-        "linear_from_rnn_hidden":    _pred_lin(X_test_std).mean(axis=0).tolist(),
-        "analytic_mean_constant_kl": (kl_opt_constant / kl_opt_constant.sum()).tolist(),
-    }
+        print("    evaluating metrics...", flush=True)
+        metrics = {
+            "mlp_from_rnn_hidden":       _evaluate_bernoulli_metrics(_pred_mlp(X_test),       Y_test, tol, eps),
+            "linear_from_rnn_hidden":    _evaluate_bernoulli_metrics(_pred_lin(X_test),       Y_test, tol, eps),
+            "analytic_mean_constant_kl": _evaluate_bernoulli_metrics(_pred_bce_const(X_test), Y_test, tol, eps),
+        }
+
+        mean_pred_belief = {
+            "mlp_from_rnn_hidden":       _pred_mlp(X_test).mean(axis=0).tolist(),
+            "linear_from_rnn_hidden":    _pred_lin(X_test).mean(axis=0).tolist(),
+            "analytic_mean_constant_kl": bce_constant.tolist(),
+        }
+
+    else:
+        # -----------------------------------------------------------------
+        # Categorical pipeline: KL loss + softmax
+        # -----------------------------------------------------------------
+        # Normalize train distribution to simplex for KL loss
+        Y_train_dist = np.clip(Y_train, eps, None)
+        Y_train_dist /= Y_train_dist.sum(axis=1, keepdims=True)
+
+        # Analytic mean constant: mean of training beliefs (already on simplex)
+        kl_opt_constant = Y_train_dist.mean(axis=0)
+
+        print("    training MLP probe...", flush=True)
+        rng, k = jax.random.split(rng)
+        mlp_params = _init_mlp(k, in_dim, mlp_hidden_layers, out_dim)
+        mlp_params = _train_kl(mlp_params, _mlp_forward, X_train_std, Y_train_dist,
+                                lr=mlp_lr, weight_decay=mlp_weight_decay,
+                                epochs=epochs, batch_size=batch_size, eps=eps)
+
+        print("    training linear probe...", flush=True)
+        rng, k = jax.random.split(rng)
+        lin_params = _init_linear(k, in_dim, out_dim)
+        lin_params = _train_kl(lin_params, _linear_forward, X_train_std, Y_train_dist,
+                                lr=linear_lr, weight_decay=linear_weight_decay,
+                                epochs=epochs, batch_size=batch_size, eps=eps)
+
+        def _pred_mlp(X):
+            return _predict(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
+        def _pred_lin(X):
+            return _predict(_linear_forward, lin_params, X, h_mean, h_std, eps)
+        def _pred_kl_opt(X):
+            p = np.clip(kl_opt_constant, eps, None); p /= p.sum()
+            return np.tile(p, (X.shape[0], 1))
+
+        print("    evaluating metrics...", flush=True)
+        metrics = {
+            "mlp_from_rnn_hidden":       _evaluate_metrics(_pred_mlp(X_test),         Y_test, tol, eps),
+            "linear_from_rnn_hidden":    _evaluate_metrics(_pred_lin(X_test),         Y_test, tol, eps),
+            "analytic_mean_constant_kl": _evaluate_metrics(_pred_kl_opt(X_test_std),  Y_test, tol, eps),
+        }
+
+        mean_pred_belief = {
+            "mlp_from_rnn_hidden":       _pred_mlp(X_test).mean(axis=0).tolist(),
+            "linear_from_rnn_hidden":    _pred_lin(X_test).mean(axis=0).tolist(),
+            "analytic_mean_constant_kl": (kl_opt_constant / kl_opt_constant.sum()).tolist(),
+        }
 
     result = {
         "checkpoint_idx":   checkpoint_idx,

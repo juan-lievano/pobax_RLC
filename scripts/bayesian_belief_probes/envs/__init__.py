@@ -48,6 +48,13 @@ class EnvHandler(ABC):
         """Structured belief tensor shape, e.g. (G, G, 4) for CompassWorld."""
         ...
 
+    def belief_type(self) -> str:
+        """
+        'categorical': beliefs sum to 1; use KL loss + softmax probe.
+        'bernoulli':   K independent probabilities in [0,1]; use BCE loss + sigmoid probe.
+        """
+        return "categorical"
+
     def extras_spec(self) -> dict:
         """
         Dict of {name: shape_tuple} for env-specific extras to record per step.
