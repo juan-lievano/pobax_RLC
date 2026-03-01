@@ -88,14 +88,42 @@ def _linear_forward(params, x):
 
 
 
-def _train_bce(init_params, apply_fn, X_train, Y_train,
-               lr=1e-3, weight_decay=0.0, epochs=80, batch_size=1024):
-    """BCE loss + sigmoid output for K independent Bernoulli beliefs."""
-    X_train = np.asarray(X_train, dtype=np.float32)
-    Y_train = np.asarray(Y_train, dtype=np.float32)
-    n = X_train.shape[0]
+def _make_bce_loss(apply_fn):
+    def loss_fn(params, x, y):
+        return jnp.mean(optax.sigmoid_binary_cross_entropy(apply_fn(params, x), y))
+    return loss_fn
+
+
+def _make_kl_loss(apply_fn, eps=1e-12):
+    def loss_fn(params, x, y):
+        logits = apply_fn(params, x)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        y_c = jnp.clip(y, eps, 1.0)
+        y_n = y_c / jnp.sum(y_c, axis=-1, keepdims=True)
+        return jnp.mean(jnp.sum(y_n * (jnp.log(y_n) - log_probs), axis=-1))
+    return loss_fn
+
+
+def _run_training(init_params, loss_fn, X_train, Y_train,
+                  lr=1e-3, weight_decay=0.0, epochs=80, batch_size=1024):
+    """Training loop optimised for GPU (and transparent on CPU).
+
+    Data is loaded to device once to avoid per-batch host→device transfers.
+    The inner batch loop is replaced with lax.scan to eliminate Python
+    dispatch overhead per batch. The outer epoch loop stays in Python (80
+    iterations, negligible overhead).
+    """
+    n = len(X_train)
     if n == 0:
         return init_params
+
+    X_dev = jnp.asarray(X_train, dtype=jnp.float32)
+    Y_dev = jnp.asarray(Y_train, dtype=jnp.float32)
+    # If n < batch_size there would be 0 batches and lax.scan returns untrained
+    # params silently.  Use all data as a single batch instead.
+    if n < batch_size:
+        batch_size = n
+    n_batches = n // batch_size  # last partial batch dropped (< batch_size rows)
 
     opt = optax.adamw(lr, weight_decay=weight_decay)
     params = init_params
@@ -103,62 +131,24 @@ def _train_bce(init_params, apply_fn, X_train, Y_train,
 
     @jax.jit
     def step(p, s, x, y):
-        def loss_fn(params):
-            logits = apply_fn(params, x)
-            return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, y))
-        grads = jax.grad(loss_fn)(p)
+        grads = jax.grad(loss_fn)(p, x, y)
         updates, new_s = opt.update(grads, s, p)
-        new_p = optax.apply_updates(p, updates)
-        return new_p, new_s
-
-    rng = np.random.default_rng(0)
-    for epoch in range(epochs):
-        perm = rng.permutation(n)
-        for i in range(0, n, batch_size):
-            idx = perm[i : i + batch_size]
-            params, opt_state = step(
-                params, opt_state,
-                jnp.asarray(X_train[idx]),
-                jnp.asarray(Y_train[idx]),
-            )
-    return params
-
-
-def _train_kl(init_params, apply_fn, X_train, Y_train_dist,
-               lr=1e-3, weight_decay=0.0, epochs=80, batch_size=1024, eps=1e-12):
-    X_train = np.asarray(X_train, dtype=np.float32)
-    Y_train_dist = np.asarray(Y_train_dist, dtype=np.float32)
-    n = X_train.shape[0]
-    if n == 0:
-        return init_params
-
-    opt = optax.adamw(lr, weight_decay=weight_decay)
-    params = init_params
-    opt_state = opt.init(params)
+        return optax.apply_updates(p, updates), new_s
 
     @jax.jit
-    def step(p, s, x, y):
-        def loss_fn(params):
-            logits = apply_fn(params, x)
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
-            y_c = jnp.clip(y, eps, 1.0)
-            y_n = y_c / jnp.sum(y_c, axis=-1, keepdims=True)
-            return jnp.mean(jnp.sum(y_n * (jnp.log(y_n) - log_probs), axis=-1))
-        grads = jax.grad(loss_fn)(p)
-        updates, new_s = opt.update(grads, s, p)
-        new_p = optax.apply_updates(p, updates)
-        return new_p, new_s
+    def train_epoch(params, opt_state, rng_key):
+        perm = jax.random.permutation(rng_key, n)[:n_batches * batch_size]
+        X_b = X_dev[perm].reshape(n_batches, batch_size, X_dev.shape[-1])
+        Y_b = Y_dev[perm].reshape(n_batches, batch_size, Y_dev.shape[-1])
+        def scan_step(carry, xy):
+            return step(carry[0], carry[1], *xy), None
+        (params, opt_state), _ = jax.lax.scan(scan_step, (params, opt_state), (X_b, Y_b))
+        return params, opt_state
 
-    rng = np.random.default_rng(0)
-    for epoch in range(epochs):
-        perm = rng.permutation(n)
-        for i in range(0, n, batch_size):
-            idx = perm[i : i + batch_size]
-            params, opt_state = step(
-                params, opt_state,
-                jnp.asarray(X_train[idx]),
-                jnp.asarray(Y_train_dist[idx]),
-            )
+    rng = jax.random.PRNGKey(0)
+    for _ in range(epochs):
+        rng, k = jax.random.split(rng)
+        params, opt_state = train_epoch(params, opt_state, k)
     return params
 
 
@@ -463,7 +453,7 @@ def train_and_save(
         Y_train = Y_train[idx]
         print(f"    subsampled train set: {len(idx)} / {train_mask.sum()} rows")
 
-    X_train_std, X_test_std, h_mean, h_std = _standardize(X_train, X_test, eps)
+    X_train_std, _, h_mean, h_std = _standardize(X_train, X_test, eps)
 
     rng = jax.random.PRNGKey(0)
     out_dim = belief_dim
@@ -476,37 +466,37 @@ def train_and_save(
         print(f"    [bernoulli] training MLP probe...", flush=True)
         rng, k = jax.random.split(rng)
         mlp_params = _init_mlp(k, in_dim, mlp_hidden_layers, out_dim)
-        mlp_params = _train_bce(mlp_params, _mlp_forward, X_train_std, Y_train,
-                                lr=mlp_lr, weight_decay=mlp_weight_decay,
-                                epochs=epochs, batch_size=batch_size)
+        mlp_params = _run_training(mlp_params, _make_bce_loss(_mlp_forward), X_train_std, Y_train,
+                                   lr=mlp_lr, weight_decay=mlp_weight_decay,
+                                   epochs=epochs, batch_size=batch_size)
 
         print(f"    [bernoulli] training linear probe...", flush=True)
         rng, k = jax.random.split(rng)
         lin_params = _init_linear(k, in_dim, out_dim)
-        lin_params = _train_bce(lin_params, _linear_forward, X_train_std, Y_train,
-                                lr=linear_lr, weight_decay=linear_weight_decay,
-                                epochs=epochs, batch_size=batch_size)
-
-        def _pred_mlp(X):
-            return _predict_bernoulli(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
-        def _pred_lin(X):
-            return _predict_bernoulli(_linear_forward, lin_params, X, h_mean, h_std, eps)
+        lin_params = _run_training(lin_params, _make_bce_loss(_linear_forward), X_train_std, Y_train,
+                                   lr=linear_lr, weight_decay=linear_weight_decay,
+                                   epochs=epochs, batch_size=batch_size)
 
         # Constant baseline: mean p_i over training set for each rock
         bce_constant = Y_train.mean(axis=0)
-        def _pred_bce_const(X):
-            return np.tile(bce_constant, (X.shape[0], 1))
 
         print("    evaluating metrics...", flush=True)
+        # Compute test predictions once; reuse for both metrics and mean_pred_belief.
+        # _predict_bernoulli receives raw X_test and standardizes internally using
+        # h_mean/h_std — matching the standardization seen during training.
+        mlp_pred  = _predict_bernoulli(_mlp_forward,    mlp_params, X_test, h_mean, h_std, eps)
+        lin_pred  = _predict_bernoulli(_linear_forward, lin_params,  X_test, h_mean, h_std, eps)
+        const_pred = np.tile(bce_constant, (X_test.shape[0], 1))
+
         metrics = {
-            "mlp_from_rnn_hidden":       _evaluate_bernoulli_metrics(_pred_mlp(X_test),       Y_test, tol, eps),
-            "linear_from_rnn_hidden":    _evaluate_bernoulli_metrics(_pred_lin(X_test),       Y_test, tol, eps),
-            "analytic_mean_constant_kl": _evaluate_bernoulli_metrics(_pred_bce_const(X_test), Y_test, tol, eps),
+            "mlp_from_rnn_hidden":       _evaluate_bernoulli_metrics(mlp_pred,   Y_test, tol, eps),
+            "linear_from_rnn_hidden":    _evaluate_bernoulli_metrics(lin_pred,   Y_test, tol, eps),
+            "analytic_mean_constant_kl": _evaluate_bernoulli_metrics(const_pred, Y_test, tol, eps),
         }
 
         mean_pred_belief = {
-            "mlp_from_rnn_hidden":       _pred_mlp(X_test).mean(axis=0).tolist(),
-            "linear_from_rnn_hidden":    _pred_lin(X_test).mean(axis=0).tolist(),
+            "mlp_from_rnn_hidden":       mlp_pred.mean(axis=0).tolist(),
+            "linear_from_rnn_hidden":    lin_pred.mean(axis=0).tolist(),
             "analytic_mean_constant_kl": bce_constant.tolist(),
         }
 
@@ -524,36 +514,37 @@ def train_and_save(
         print("    training MLP probe...", flush=True)
         rng, k = jax.random.split(rng)
         mlp_params = _init_mlp(k, in_dim, mlp_hidden_layers, out_dim)
-        mlp_params = _train_kl(mlp_params, _mlp_forward, X_train_std, Y_train_dist,
-                                lr=mlp_lr, weight_decay=mlp_weight_decay,
-                                epochs=epochs, batch_size=batch_size, eps=eps)
+        mlp_params = _run_training(mlp_params, _make_kl_loss(_mlp_forward, eps), X_train_std, Y_train_dist,
+                                   lr=mlp_lr, weight_decay=mlp_weight_decay,
+                                   epochs=epochs, batch_size=batch_size)
 
         print("    training linear probe...", flush=True)
         rng, k = jax.random.split(rng)
         lin_params = _init_linear(k, in_dim, out_dim)
-        lin_params = _train_kl(lin_params, _linear_forward, X_train_std, Y_train_dist,
-                                lr=linear_lr, weight_decay=linear_weight_decay,
-                                epochs=epochs, batch_size=batch_size, eps=eps)
-
-        def _pred_mlp(X):
-            return _predict(_mlp_forward, mlp_params, X, h_mean, h_std, eps)
-        def _pred_lin(X):
-            return _predict(_linear_forward, lin_params, X, h_mean, h_std, eps)
-        def _pred_kl_opt(X):
-            p = np.clip(kl_opt_constant, eps, None); p /= p.sum()
-            return np.tile(p, (X.shape[0], 1))
+        lin_params = _run_training(lin_params, _make_kl_loss(_linear_forward, eps), X_train_std, Y_train_dist,
+                                   lr=linear_lr, weight_decay=linear_weight_decay,
+                                   epochs=epochs, batch_size=batch_size)
 
         print("    evaluating metrics...", flush=True)
+        # Compute test predictions once; reuse for both metrics and mean_pred_belief.
+        # _predict receives raw X_test and standardizes internally using h_mean/h_std
+        # — matching the standardization seen during training.
+        kl_constant_norm = np.clip(kl_opt_constant, eps, None)
+        kl_constant_norm /= kl_constant_norm.sum()
+        mlp_pred   = _predict(_mlp_forward,    mlp_params, X_test, h_mean, h_std, eps)
+        lin_pred   = _predict(_linear_forward, lin_params,  X_test, h_mean, h_std, eps)
+        const_pred = np.tile(kl_constant_norm, (X_test.shape[0], 1))
+
         metrics = {
-            "mlp_from_rnn_hidden":       _evaluate_metrics(_pred_mlp(X_test),         Y_test, tol, eps),
-            "linear_from_rnn_hidden":    _evaluate_metrics(_pred_lin(X_test),         Y_test, tol, eps),
-            "analytic_mean_constant_kl": _evaluate_metrics(_pred_kl_opt(X_test_std),  Y_test, tol, eps),
+            "mlp_from_rnn_hidden":       _evaluate_metrics(mlp_pred,   Y_test, tol, eps),
+            "linear_from_rnn_hidden":    _evaluate_metrics(lin_pred,   Y_test, tol, eps),
+            "analytic_mean_constant_kl": _evaluate_metrics(const_pred, Y_test, tol, eps),
         }
 
         mean_pred_belief = {
-            "mlp_from_rnn_hidden":       _pred_mlp(X_test).mean(axis=0).tolist(),
-            "linear_from_rnn_hidden":    _pred_lin(X_test).mean(axis=0).tolist(),
-            "analytic_mean_constant_kl": (kl_opt_constant / kl_opt_constant.sum()).tolist(),
+            "mlp_from_rnn_hidden":       mlp_pred.mean(axis=0).tolist(),
+            "linear_from_rnn_hidden":    lin_pred.mean(axis=0).tolist(),
+            "analytic_mean_constant_kl": kl_constant_norm.tolist(),
         }
 
     result = {

@@ -26,10 +26,30 @@ from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import Normalize
 from matplotlib.patches import Patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from envs import get_env_handler
+
+
+# ---------------------------------------------------------------------------
+# Experiment label helper
+# ---------------------------------------------------------------------------
+
+def _make_experiment_label(config: dict) -> str:
+    """Format a config dict into a compact one-line figure subtitle."""
+    if not config:
+        return ""
+    env  = config.get("env_name", "?")
+    h    = config.get("hidden_size", "?")
+    dc   = "dc" if config.get("double_critic") else "no-dc"
+    ml   = "memoryless" if config.get("memoryless") else "recurrent"
+    ac   = "ac" if config.get("action_concat") else "no-ac"
+    ent  = config.get("entropy_coeff", "?")
+    ts   = config.get("total_steps", 0)
+    ts_s = f"{ts / 1e6:.1f}M" if isinstance(ts, (int, float)) and ts > 0 else "?"
+    return f"{env}  h={h}  {dc}  {ml}  {ac}  ent={ent}  steps={ts_s}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +142,54 @@ def aggregate_mean_pred(records: List[dict]) -> Dict:
     return {k: np.stack(v).mean(axis=0) for k, v in accum.items()}
 
 
+def _load_rewards_by_ckpt(results_dir: Path, h_idx: int) -> Dict[int, np.ndarray]:
+    """
+    Load per-seed mean episodic return for each checkpoint directory.
+
+    Returns:
+        {ckpt_idx: array of shape [n_seeds]} — mean episodic return per seed,
+        averaged over trajectories within that seed.
+    """
+    ckpt_dirs = sorted(
+        [d for d in results_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint_")],
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+    result: Dict[int, np.ndarray] = {}
+    for ckpt_dir in ckpt_dirs:
+        ckpt_idx = int(ckpt_dir.name.split("_")[1])
+        npz_path = ckpt_dir / f"h{h_idx}_trajectories.npz"
+        if not npz_path.exists():
+            continue
+        data = np.load(npz_path, allow_pickle=False)
+        if "rewards" not in data or "masks" not in data:
+            continue
+        rewards = data["rewards"]          # [n_seeds, n_traj, max_len]
+        masks   = data["masks"]            # [n_seeds, n_traj, max_len]
+        ep_returns = (rewards * masks).sum(axis=-1)   # [n_seeds, n_traj]
+        result[ckpt_idx] = ep_returns.mean(axis=1)    # [n_seeds]
+    return result
+
+
+def _build_metric_lookup(records: List[dict]) -> Dict:
+    """
+    Returns {(ckpt_idx, seed_idx, probe_name, metric_name): float}
+    for fast per-point access in reward-vs-metric scatter.
+    """
+    lookup: Dict = {}
+    for r in records:
+        c, s = r["checkpoint_idx"], r["seed_idx"]
+        for probe, mdict in r["metrics"].items():
+            for metric, val in mdict.items():
+                lookup[(c, s, probe, metric)] = val
+    return lookup
+
+
 # ---------------------------------------------------------------------------
 # Metric curves
 # ---------------------------------------------------------------------------
 
 def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0,
-                       metric_keys: list = METRIC_KEYS):
+                       metric_keys: list = METRIC_KEYS, config: dict = None):
     grouped = aggregate(records)
 
     ckpt_indices = sorted({r["checkpoint_idx"] for r in records})
@@ -183,6 +245,10 @@ def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0,
         fig.legend(handles=legend_handles, loc="lower center",
                    bbox_to_anchor=(0.5, -0.04), ncol=len(probes), fontsize=9)
 
+        label = _make_experiment_label(config)
+        if label:
+            fig.suptitle(label, fontsize=8, color="dimgray", style="italic")
+
         suffix = f"_h{h}" if len(hparams) > 1 else ""
         out_path = out_dir / f"metric_curves{suffix}.png"
         fig.savefig(out_path, dpi=180, bbox_inches="tight")
@@ -195,7 +261,8 @@ def plot_metric_curves(records: List[dict], out_dir: Path, h_idx: int = 0,
 # ---------------------------------------------------------------------------
 
 def _plot_compass_triangle_grids(
-    records: List[dict], results_dir: Path, out_dir: Path, h_idx: int = 0
+    records: List[dict], results_dir: Path, out_dir: Path, h_idx: int = 0,
+    config: dict = None,
 ):
     mean_preds = aggregate_mean_pred(records)
 
@@ -263,7 +330,11 @@ def _plot_compass_triangle_grids(
             title = f"{PROBE_LABELS.get(probe, probe)}\n{col_label} (ckpt {c})"
             handler.visualize_beliefs(vec, ax, title=title, vmin=vmin, vmax=vmax)
 
-    fig.suptitle(f"Mean Predicted Belief — {env_name}", fontsize=13)
+    label = _make_experiment_label(config)
+    suptitle = f"Mean Predicted Belief — {env_name}"
+    if label:
+        suptitle = f"{suptitle}\n{label}"
+    fig.suptitle(suptitle, fontsize=11)
 
     hparams = sorted({r["hparam_idx"] for r in records})
     suffix = f"_h{h_idx}" if len(hparams) > 1 else ""
@@ -278,7 +349,7 @@ def _plot_compass_triangle_grids(
 # ---------------------------------------------------------------------------
 
 def _plot_marquee_belief_bars(
-    records: List[dict], out_dir: Path, h_idx: int = 0
+    records: List[dict], out_dir: Path, h_idx: int = 0, config: dict = None,
 ):
     """
     For Marquee: plot mean predicted belief (bar chart over goals) at
@@ -340,7 +411,11 @@ def _plot_marquee_belief_bars(
                 ax.set_title(title, fontsize=9)
                 ax.spines[["right", "top"]].set_visible(False)
 
-    fig.suptitle(f"Mean Predicted Belief — {env_name}", fontsize=13)
+    label = _make_experiment_label(config)
+    suptitle = f"Mean Predicted Belief — {env_name}"
+    if label:
+        suptitle = f"{suptitle}\n{label}"
+    fig.suptitle(suptitle, fontsize=11)
 
     hparams = sorted({r["hparam_idx"] for r in records})
     suffix = f"_h{h_idx}" if len(hparams) > 1 else ""
@@ -354,7 +429,8 @@ def _plot_marquee_belief_bars(
 # Belief sanity curves (Marquee / envs with extras_goal_idx)
 # ---------------------------------------------------------------------------
 
-def plot_belief_sanity_curves(records: List[dict], out_dir: Path, h_idx: int = 0):
+def plot_belief_sanity_curves(records: List[dict], out_dir: Path, h_idx: int = 0,
+                               config: dict = None):
     """
     Plot belief sanity metrics vs checkpoint index.
 
@@ -411,6 +487,10 @@ def plot_belief_sanity_curves(records: List[dict], out_dir: Path, h_idx: int = 0
     ax.spines[["right", "top"]].set_visible(False)
     ax.legend(fontsize=9)
 
+    label = _make_experiment_label(config)
+    if label:
+        fig.suptitle(label, fontsize=8, color="dimgray", style="italic")
+
     suffix = f"_h{h_idx}"
     out_path = out_dir / f"belief_sanity{suffix}.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
@@ -422,38 +502,21 @@ def plot_belief_sanity_curves(records: List[dict], out_dir: Path, h_idx: int = 0
 # Episodic reward curve
 # ---------------------------------------------------------------------------
 
-def plot_reward_curves(results_dir: Path, out_dir: Path, h_idx: int = 0):
+def plot_reward_curves(results_dir: Path, out_dir: Path, h_idx: int = 0,
+                       config: dict = None):
     """
-    For each checkpoint, load the NPZ and compute mean episodic return
-    (sum of per-step rewards per trajectory, averaged over trajectories and
-    then reported as mean ± std across seeds).  Saves reward_curve[_h{h}].png.
+    Load per-seed mean episodic return for each checkpoint and plot mean ± std.
+    Saves reward_curve[_h{h}].png.
     """
-    ckpt_dirs = sorted(
-        [d for d in results_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint_")],
-        key=lambda d: int(d.name.split("_")[1]),
-    )
-
-    xs, means, stds = [], [], []
-    for ckpt_dir in ckpt_dirs:
-        ckpt_idx = int(ckpt_dir.name.split("_")[1])
-        npz_path = ckpt_dir / f"h{h_idx}_trajectories.npz"
-        if not npz_path.exists():
-            continue
-        data = np.load(npz_path, allow_pickle=False)
-        if "rewards" not in data:
-            continue
-        rewards = data["rewards"]  # [n_seeds, n_traj, max_len]
-        masks   = data["masks"]    # [n_seeds, n_traj, max_len]
-        # Episodic return = sum of rewards over valid steps per trajectory
-        ep_returns  = (rewards * masks).sum(axis=-1)  # [n_seeds, n_traj]
-        seed_means  = ep_returns.mean(axis=1)          # [n_seeds]
-        xs.append(ckpt_idx)
-        means.append(float(seed_means.mean()))
-        stds.append(float(seed_means.std()) if len(seed_means) > 1 else 0.0)
-
-    if not xs:
+    rewards_by_ckpt = _load_rewards_by_ckpt(results_dir, h_idx)
+    if not rewards_by_ckpt:
         print("  no reward data found in NPZs — skipping reward curve")
         return
+
+    xs     = sorted(rewards_by_ckpt)
+    means  = [float(rewards_by_ckpt[c].mean()) for c in xs]
+    stds   = [float(rewards_by_ckpt[c].std()) if len(rewards_by_ckpt[c]) > 1 else 0.0
+              for c in xs]
 
     xs_arr = np.array(xs)
     m_arr  = np.array(means)
@@ -469,6 +532,10 @@ def plot_reward_curves(results_dir: Path, out_dir: Path, h_idx: int = 0):
     ax.spines[["right", "top"]].set_visible(False)
     ax.legend(fontsize=9)
 
+    label = _make_experiment_label(config)
+    if label:
+        fig.suptitle(label, fontsize=8, color="dimgray", style="italic")
+
     suffix = f"_h{h_idx}"
     out_path = out_dir / f"reward_curve{suffix}.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
@@ -477,16 +544,242 @@ def plot_reward_curves(results_dir: Path, out_dir: Path, h_idx: int = 0):
 
 
 # ---------------------------------------------------------------------------
+# Reward vs belief metrics scatter + stats
+# ---------------------------------------------------------------------------
+
+def plot_reward_vs_metrics(
+    records: List[dict],
+    results_dir: Path,
+    out_dir: Path,
+    h_idx: int = 0,
+    config: dict = None,
+    metric_keys: list = METRIC_KEYS,
+):
+    """
+    Scatter: episodic reward vs each belief metric across all (seed, checkpoint) pairs.
+
+    Each point is one (seed, checkpoint) pair.  Points are coloured by checkpoint
+    progress (early=dark, late=bright).  A linear fit is overlaid on each panel.
+
+    Produces two figures:
+      reward_vs_metrics_h{h}.png            — raw y-axes (per subplot)
+      reward_vs_metrics_normalized_h{h}.png — shared y-axis per metric column,
+                                              starting at 0, so slopes are comparable
+
+    Also saves reward_metric_stats_h{h}.json with:
+        Pearson r, Spearman ρ, R² for every (probe, metric) combination.
+    """
+    rewards_by_ckpt = _load_rewards_by_ckpt(results_dir, h_idx)
+    if not rewards_by_ckpt:
+        print("  no reward data — skipping reward-vs-metric scatter")
+        return
+
+    h_records = [r for r in records if r["hparam_idx"] == h_idx]
+    if not h_records:
+        return
+
+    lookup = _build_metric_lookup(h_records)
+
+    present_probes = {key[2] for key in lookup}
+    probes = [p for p in PROBE_ORDER if p in present_probes]
+    if not probes:
+        return
+
+    # Checkpoint colour normalisation (darker = earlier)
+    ckpt_list    = sorted(rewards_by_ckpt)
+    n_ckpts      = len(ckpt_list)
+    ckpt_to_norm = {c: i / max(n_ckpts - 1, 1) for i, c in enumerate(ckpt_list)}
+    cmap         = plt.cm.viridis
+
+    # ------------------------------------------------------------------
+    # Pass 1: collect scatter data and compute stats (no plotting yet)
+    # ------------------------------------------------------------------
+    # scatter_data[(probe, metric)] = (xs_arr, ys_arr, colours_arr) | None
+    scatter_data: Dict = {}
+    stats_out:    Dict = {}
+
+    for probe in probes:
+        stats_out[probe] = {}
+        for metric in metric_keys:
+            xs, ys, colours = [], [], []
+            for c, seed_rewards in rewards_by_ckpt.items():
+                norm = ckpt_to_norm[c]
+                for s_idx, rw in enumerate(seed_rewards):
+                    val = lookup.get((c, s_idx, probe, metric))
+                    if val is None or val != val:
+                        continue
+                    xs.append(float(rw))
+                    ys.append(float(val))
+                    colours.append(norm)
+
+            if len(xs) < 3:
+                scatter_data[(probe, metric)] = None
+                continue
+
+            xs_arr = np.array(xs)
+            ys_arr = np.array(ys)
+            scatter_data[(probe, metric)] = (xs_arr, ys_arr, np.array(colours))
+
+            # Statistics (compatible with scipy pre- and post-1.9 API)
+            pearson_r = spearman_rho = r_sq = float("nan")
+            pearson_p = spearman_p = float("nan")
+            try:
+                from scipy.stats import pearsonr, spearmanr, linregress
+                _pr = pearsonr(xs_arr, ys_arr)
+                _sr = spearmanr(xs_arr, ys_arr)
+                _lr = linregress(xs_arr, ys_arr)
+                pearson_r    = float(getattr(_pr, "statistic", _pr[0]))
+                pearson_p    = float(getattr(_pr, "pvalue",    _pr[1]))
+                spearman_rho = float(getattr(_sr, "statistic", _sr[0]))
+                spearman_p   = float(getattr(_sr, "pvalue",    _sr[1]))
+                r_sq         = float(_lr.rvalue ** 2)
+            except ImportError:
+                corr = float(np.corrcoef(xs_arr, ys_arr)[0, 1])
+                pearson_r = corr
+                r_sq      = corr ** 2
+
+            stats_out[probe][metric] = {
+                "n_points":     len(xs),
+                "pearson_r":    pearson_r,
+                "pearson_p":    pearson_p,
+                "spearman_rho": spearman_rho,
+                "spearman_p":   spearman_p,
+                "r_squared":    r_sq,
+            }
+
+    # ------------------------------------------------------------------
+    # Shared y-limits per metric column (for the normalised figure)
+    # y starts at 0; top is the max value across all probes for that metric.
+    # ------------------------------------------------------------------
+    shared_ylims: Dict = {}
+    for metric in metric_keys:
+        all_ys = []
+        for probe in probes:
+            entry = scatter_data.get((probe, metric))
+            if entry is not None:
+                all_ys.extend(entry[1].tolist())   # entry[1] = ys_arr
+        if all_ys:
+            ymax = max(v for v in all_ys if v == v)
+            shared_ylims[metric] = (0.0, ymax * 1.05)
+
+    # ------------------------------------------------------------------
+    # Pass 2: draw figures (raw axes, then normalised axes)
+    # ------------------------------------------------------------------
+    def _draw_fig(ylims_override, stem):
+        n_rows = len(probes)
+        n_cols = len(metric_keys)
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(3.4 * n_cols, 3.4 * n_rows),
+            constrained_layout=True,
+        )
+        if n_rows == 1:
+            axes = axes[np.newaxis, :]
+        if n_cols == 1:
+            axes = axes[:, np.newaxis]
+
+        for r_idx, probe in enumerate(probes):
+            for c_idx, metric in enumerate(metric_keys):
+                ax = axes[r_idx, c_idx]
+                entry = scatter_data.get((probe, metric))
+                if entry is None:
+                    ax.axis("off")
+                    continue
+
+                xs_arr, ys_arr, colours_arr = entry
+                ax.scatter(xs_arr, ys_arr, c=colours_arr, cmap=cmap,
+                           alpha=0.55, s=18, linewidths=0)
+
+                try:
+                    coeffs = np.polyfit(xs_arr, ys_arr, 1)
+                    x_line = np.linspace(xs_arr.min(), xs_arr.max(), 100)
+                    ax.plot(x_line, np.polyval(coeffs, x_line),
+                            color="crimson", linewidth=1.5, alpha=0.85)
+                except Exception:
+                    pass
+
+                if ylims_override and metric in ylims_override:
+                    ax.set_ylim(*ylims_override[metric])
+
+                s      = stats_out[probe].get(metric, {})
+                r_val  = s.get("pearson_r",    float("nan"))
+                rho    = s.get("spearman_rho", float("nan"))
+                r2     = s.get("r_squared",    float("nan"))
+                r_tag   = f"{r_val:+.2f}" if r_val  == r_val  else "n/a"
+                rho_tag = f"{rho:+.2f}"   if rho    == rho    else "n/a"
+                r2_tag  = f"{r2:.2f}"     if r2     == r2     else "n/a"
+
+                ax.set_xlabel("Mean episodic return", fontsize=8)
+                ax.set_ylabel(METRIC_TITLES.get(metric, metric), fontsize=8)
+                ax.set_title(
+                    f"{PROBE_LABELS.get(probe, probe)}\n"
+                    f"r={r_tag}  ρ={rho_tag}  R²={r2_tag}",
+                    fontsize=8,
+                )
+                ax.tick_params(labelsize=7)
+                ax.spines[["right", "top"]].set_visible(False)
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.5, pad=0.01)
+        cbar.set_label("Checkpoint (early → late)", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+        label    = _make_experiment_label(config)
+        suptitle = stem.replace("_", " ").title()
+        if label:
+            suptitle = f"{suptitle}\n{label}"
+        fig.suptitle(suptitle, fontsize=9 if label else 11)
+
+        out_path = out_dir / f"{stem}_h{h_idx}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  saved {out_path}")
+
+    _draw_fig(None,           "reward_vs_metrics")
+    _draw_fig(shared_ylims,   "reward_vs_metrics_normalized")
+
+    # ------------------------------------------------------------------
+    # Save stats JSON
+    # ------------------------------------------------------------------
+    env_name      = h_records[0].get("env_name", "")
+    n_seeds_found = len({r["seed_idx"] for r in h_records})
+    stats_record  = {
+        "env_name":      env_name,
+        "hparam_idx":    h_idx,
+        "n_checkpoints": n_ckpts,
+        "n_seeds":       n_seeds_found,
+        "metric_keys":   metric_keys,
+        "stats":         stats_out,
+    }
+    if config:
+        stats_record["config"] = config
+
+    stats_path = out_dir / f"reward_metric_stats_h{h_idx}.json"
+    with open(stats_path, "w") as f:
+        json.dump(stats_record, f, indent=2)
+    print(f"  saved {stats_path}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0):
+def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0,
+                      config: dict = None):
     out_dir.mkdir(parents=True, exist_ok=True)
     records = load_all_jsons(results_dir)
 
     if not records:
         print(f"  no metrics JSONs found in {results_dir}")
         return
+
+    # Load experiment config from JSON if not provided (standalone CLI usage)
+    if config is None:
+        config_path = results_dir / "run_config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
 
     env_name = records[0].get("env_name", "")
     print(f"  found {len(records)} JSON records, env='{env_name}'")
@@ -497,20 +790,26 @@ def visualize_results(results_dir: Path, out_dir: Path, h_idx: int = 0):
     )
 
     # --- Generic metric curves (always) ---
-    plot_metric_curves(records, out_dir, h_idx=h_idx, metric_keys=metric_keys)
+    plot_metric_curves(records, out_dir, h_idx=h_idx, metric_keys=metric_keys,
+                       config=config)
 
     # --- Belief sanity curves (when extras_goal_idx is in the NPZ, e.g. Marquee) ---
-    plot_belief_sanity_curves(records, out_dir, h_idx=h_idx)
+    plot_belief_sanity_curves(records, out_dir, h_idx=h_idx, config=config)
 
     # --- Episodic reward curve (always, when NPZs contain rewards) ---
-    plot_reward_curves(results_dir, out_dir, h_idx=h_idx)
+    plot_reward_curves(results_dir, out_dir, h_idx=h_idx, config=config)
+
+    # --- Reward vs belief metrics scatter + stats JSON ---
+    plot_reward_vs_metrics(records, results_dir, out_dir, h_idx=h_idx,
+                           config=config, metric_keys=metric_keys)
 
     # --- Env-specific visualizations ---
     if env_name.startswith("compass_world_"):
-        _plot_compass_triangle_grids(records, results_dir, out_dir, h_idx=h_idx)
+        _plot_compass_triangle_grids(records, results_dir, out_dir, h_idx=h_idx,
+                                     config=config)
 
     elif env_name.startswith("marquee_"):
-        _plot_marquee_belief_bars(records, out_dir, h_idx=h_idx)
+        _plot_marquee_belief_bars(records, out_dir, h_idx=h_idx, config=config)
 
 
 # ---------------------------------------------------------------------------

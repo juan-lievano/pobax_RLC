@@ -8,10 +8,10 @@ For each checkpoint in the run directory:
 
 Usage:
     python run_probe_pipeline.py \\
-        --run_dir  results/rocksample_11_11_h256_dc_ac_5M \\
-        --n_traj   500 \\
-        --max_len  200 \\
-        [--out_dir probe_results/my_exp] \\
+        --run_dir     results/rocksample_11_11_h256_dc_ac_5M \\
+        --n_timesteps 10000 \\
+        [--n_traj     1000] \\
+        [--out_dir    probe_results/my_exp] \\
         [--h_idx 0] \\
         [--force]
 
@@ -21,6 +21,7 @@ parent directory.  If the parent contains exactly one subdirectory it
 is resolved automatically, so you never have to copy the hash string.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -70,10 +71,14 @@ def main():
     )
     p.add_argument("--run_dir",  required=True, type=Path,
                    help="Top-level Orbax run directory (contains checkpoint_* subdirs).")
-    p.add_argument("--n_traj",   required=True, type=int,
-                   help="Number of trajectories to sample per checkpoint per seed.")
-    p.add_argument("--max_len",  type=int, default=200,
-                   help="Maximum steps per trajectory (default 200).")
+    p.add_argument("--n_traj",      type=int, default=1000,
+                   help="Trajectories to sample per checkpoint per seed (default 1000).")
+    p.add_argument("--n_timesteps", type=int, default=10000,
+                   help="Training budget: probe training is capped at this many timesteps "
+                        "per seed per checkpoint, making all probes see the same amount of data "
+                        "regardless of env or checkpoint (default 10000).")
+    p.add_argument("--max_len",  type=int, default=1000,
+                   help="Maximum steps per trajectory (default 1000).")
     p.add_argument("--out_dir",  type=Path, default=None,
                    help="Root directory for probe pipeline outputs. "
                         "Defaults to probe_results/<parent-dir-of-run_dir>.")
@@ -90,10 +95,6 @@ def main():
     p.add_argument("--mlp_wd",     type=float, default=1e-4)
     p.add_argument("--linear_lr",  type=float, default=1e-2)
     p.add_argument("--linear_wd",  type=float, default=1.0)
-    p.add_argument("--n_steps",    type=int,   default=None,
-                   help="Cap training rows to this many timesteps per seed/checkpoint. "
-                        "Useful for fair probe comparison when episode length varies across "
-                        "checkpoints. If omitted, all valid training rows are used.")
     args = p.parse_args()
 
     raw_dir = args.run_dir.resolve()
@@ -117,12 +118,41 @@ def main():
     double_critic = bool(run_args.get("double_critic", False))
     memoryless    = bool(run_args.get("memoryless", False))
     action_concat = bool(run_args.get("action_concat", False))
+    def _scalar(v, t, default):
+        """Coerce an orbax-restored value (may be list/array/scalar) to a Python scalar."""
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else default
+        try:
+            return t(v)
+        except (TypeError, ValueError):
+            return default
+
+    entropy_coeff = _scalar(run_args.get("entropy_coeff"), float, 0.0)
+    total_steps   = _scalar(run_args.get("total_steps"),   int,   0)
 
     print(
         f"  env={env_name}, hidden_size={hidden_size}, "
         f"n_seeds={n_seeds}, double_critic={double_critic}, "
-        f"memoryless={memoryless}, action_concat={action_concat}"
+        f"memoryless={memoryless}, action_concat={action_concat}, "
+        f"entropy_coeff={entropy_coeff}, total_steps={total_steps}"
     )
+
+    # Save a run_config.json so visualize.py can label figures when run standalone
+    config = {
+        "env_name":      env_name,
+        "hidden_size":   hidden_size,
+        "n_seeds":       n_seeds,
+        "double_critic": double_critic,
+        "memoryless":    memoryless,
+        "action_concat": action_concat,
+        "entropy_coeff": entropy_coeff,
+        "total_steps":   total_steps,
+        "h_idx":         args.h_idx,
+    }
+    config_path = out_dir / "run_config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  saved run_config.json → {config_path}")
 
     # -----------------------------------------------------------------------
     # Discover checkpoint directories
@@ -182,7 +212,7 @@ def main():
                 mlp_weight_decay=args.mlp_wd,
                 linear_lr=args.linear_lr,
                 linear_weight_decay=args.linear_wd,
-                max_train_steps=args.n_steps,
+                max_train_steps=args.n_timesteps,
             )
 
     # -----------------------------------------------------------------------
@@ -190,7 +220,7 @@ def main():
     # -----------------------------------------------------------------------
     print("\nGenerating visualizations...")
     figures_dir = out_dir / "figures"
-    visualize_results(out_dir, figures_dir, h_idx=args.h_idx)
+    visualize_results(out_dir, figures_dir, h_idx=args.h_idx, config=config)
     print(f"\nDone. Results in {out_dir}")
 
 
