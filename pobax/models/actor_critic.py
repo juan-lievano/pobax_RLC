@@ -48,6 +48,28 @@ class ActorCritic(nn.Module):
         else:
             self.critic = Critic(hidden_size=self.hidden_size)
 
+    def forward_with_embedding(self, hidden, x):
+        """Like __call__ but also returns the internal embedding (before actor/critic heads).
+
+        For RNN agents this is the GRU output; for memoryless agents it is the
+        SimpleNN output.  Used by the probe pipeline to capture activations in a
+        single forward pass.
+
+        Returns: (hidden, pi, v, embedding)  where embedding has shape [..., H].
+        """
+        obs_dict, dones = x
+        obs = obs_dict.obs
+        action_mask = obs_dict.action_mask
+        embedding = self.embedding(obs)
+        if not self.memoryless:
+            rnn_in = (embedding, dones)
+            hidden, embedding = self.memory(hidden, rnn_in)
+
+        pi = self.actor(embedding, action_mask=action_mask)
+        v = self.critic(embedding)
+
+        return hidden, pi, jnp.squeeze(v, axis=-1), embedding
+
     def __call__(self, hidden, x):
         obs_dict, dones = x
         obs = obs_dict.obs

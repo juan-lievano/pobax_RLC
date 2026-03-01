@@ -101,7 +101,10 @@ def build_rollout_fn(
             done_in  = done[None, None]                                # [1, 1]
             obs_dict = Observation(obs=obs_in)  # action_mask=None is the default
 
-            hidden_new, pi, _ = model.apply(params_one_seed, hidden, (obs_dict, done_in))
+            hidden_new, pi, _, embedding = model.apply(
+                params_one_seed, hidden, (obs_dict, done_in),
+                method=lambda self, h, x: self.forward_with_embedding(h, x),
+            )
             action = pi.sample(seed=k_act)[0, 0].astype(jnp.int32)
 
             # Freeze hidden/obs/state after episode ends
@@ -130,11 +133,20 @@ def build_rollout_fn(
                 next_done_flag,
                 new_prev_action_onehot,
             )
+            # For memoryless agents the GRU carry is always zeros (the model returns
+            # it unchanged), so probe the FF embedding instead.  For RNN agents the
+            # GRU carry encodes history and is the correct target; note we use
+            # hidden_rec (episode-end-frozen) rather than the raw hidden_new.
+            if memoryless:
+                activations = embedding[0, 0]  # [H]  FF embedding from forward_with_embedding
+            else:
+                activations = hidden_rec[0]    # [H]  frozen GRU carry
+
             step_out = (
                 obs,               # [obs_dim]        raw obs (no prev_action) for storage
                 action,            # []               action taken
                 extras_fn(state),  # [extras_dim]     env-specific extras
-                hidden_rec[0],     # [hidden_size]    squeeze batch dim for storage
+                activations,       # [hidden_size]    FF embedding (memoryless) or GRU carry
                 mask_out,          # []               validity mask
                 reward_rec,        # []               per-step reward (0 after episode ends)
             )
