@@ -21,7 +21,7 @@ export TMPDIR=/nas/ucb/juanlievano/pip_tmp
 
 set +u
 eval "$($MAMBA_ROOT_PREFIX/bin/mamba shell hook --shell bash)"
-mamba activate pobax310
+mamba activate pobaxRLC
 set -u
 
 cd /nas/ucb/juanlievano/pobax_RLC
