@@ -40,6 +40,7 @@ from envs import get_env_handler
 
 from pobax.envs.wrappers.gymnax import Observation
 from pobax.models.actor_critic import ActorCritic
+from pobax.models.q_network import QNetwork
 from pobax.models.network import ScannedRNN
 
 
@@ -58,6 +59,7 @@ def build_rollout_fn(
     extras_dim: int,
     action_concat: bool,
     action_dim: int,
+    algo: str = 'ppo',
 ):
     """
     Returns a JIT-compiled function:
@@ -101,11 +103,18 @@ def build_rollout_fn(
             done_in  = done[None, None]                                # [1, 1]
             obs_dict = Observation(obs=obs_in)  # action_mask=None is the default
 
-            hidden_new, pi, _, embedding = model.apply(
-                params_one_seed, hidden, (obs_dict, done_in),
-                method=lambda self, h, x: self.forward_with_embedding(h, x),
-            )
-            action = pi.sample(seed=k_act)[0, 0].astype(jnp.int32)
+            if algo == 'dqn':
+                hidden_new, q_vals, embedding = model.apply(
+                    params_one_seed, hidden, (obs_dict, done_in),
+                    method=lambda self, h, x: self.forward_with_embedding(h, x),
+                )
+                action = jnp.argmax(q_vals[0, 0]).astype(jnp.int32)
+            else:
+                hidden_new, pi, _, embedding = model.apply(
+                    params_one_seed, hidden, (obs_dict, done_in),
+                    method=lambda self, h, x: self.forward_with_embedding(h, x),
+                )
+                action = pi.sample(seed=k_act)[0, 0].astype(jnp.int32)
 
             # Freeze hidden/obs/state after episode ends
             hidden_rec = jnp.where(done, hidden, hidden_new)
@@ -185,21 +194,31 @@ def sample_and_save(
     double_critic: bool,
     memoryless: bool,
     action_concat: bool,
+    algo: str = 'ppo',
     env_seed: int = 0,
 ):
     handler = get_env_handler(env_name, seed=env_seed)
     env, env_params = handler.make_raw_env()
 
     # Build model (structure must match the training run)
-    model = ActorCritic(
-        env_name,
-        handler.action_dim(),
-        hidden_size=hidden_size,
-        double_critic=double_critic,
-        memoryless=memoryless,
-        is_discrete=True,
-        is_image=False,
-    )
+    if algo == 'dqn':
+        model = QNetwork(
+            env_name,
+            handler.action_dim(),
+            hidden_size=hidden_size,
+            memoryless=memoryless,
+            is_image=False,
+        )
+    else:
+        model = ActorCritic(
+            env_name,
+            handler.action_dim(),
+            hidden_size=hidden_size,
+            double_critic=double_critic,
+            memoryless=memoryless,
+            is_discrete=True,
+            is_image=False,
+        )
 
     # Load checkpoint and extract params for this hparam set (all seeds)
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -221,6 +240,7 @@ def sample_and_save(
         extras_fn, extras_dim,
         action_concat=action_concat,
         action_dim=handler.action_dim(),
+        algo=algo,
     )
 
     # Same rng_keys for all seeds (same starting states, different policies)
@@ -306,4 +326,5 @@ if __name__ == "__main__":
         double_critic=bool(run_args.get("double_critic", False)),
         memoryless=bool(run_args.get("memoryless", False)),
         action_concat=bool(run_args.get("action_concat", False)),
+        algo=str(run_args.get("algo", "ppo")),
     )
