@@ -2,6 +2,7 @@ from gymnax.environments import environment, spaces
 
 from pobax.envs.jax.battleship import Battleship
 from .actor_critic import ActorCritic
+from .q_network import QNetwork
 
 from .continuous import *
 from .discrete import *
@@ -51,3 +52,15 @@ def get_network_fn(env: environment.Environment, env_params: environment.EnvPara
     #         is_image = True
     #         break
     return network_fn, action_size, is_image, is_discrete
+
+
+def get_q_network_fn(env: environment.Environment, env_params: environment.EnvParams):
+    """Like get_network_fn but returns QNetwork. Asserts discrete action space."""
+    assert isinstance(env.action_space(env_params), spaces.Discrete), \
+        "DQN/DRQN requires a discrete action space."
+    action_size = env.action_space(env_params).n
+    is_image = False
+    observation_space = env.observation_space(env_params).spaces['obs']
+    if len(observation_space.shape) > 1:
+        is_image = True
+    return QNetwork, action_size, is_image
