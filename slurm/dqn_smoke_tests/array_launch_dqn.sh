@@ -28,14 +28,15 @@ if [[ -z "$LINE" ]]; then
   exit 2
 fi
 
-IFS=$'\t' read -r ENV_NAME LR EPSILON_FINISH MEMORYLESS <<< "$LINE"
+IFS=$'\t' read -r ENV_NAME LR EPSILON_FINISH TRACE_LENGTH HIDDEN_SIZE <<< "$LINE"
 
-export ENV_NAME LR EPSILON_FINISH MEMORYLESS
+export ENV_NAME LR EPSILON_FINISH TRACE_LENGTH HIDDEN_SIZE
 
 echo "Selected grid row (task_id=$TASK_ID):"
 echo "  ENV_NAME=$ENV_NAME"
 echo "  LR=$LR"
 echo "  EPSILON_FINISH=$EPSILON_FINISH"
-echo "  MEMORYLESS=$MEMORYLESS"
+echo "  TRACE_LENGTH=$TRACE_LENGTH"
+echo "  HIDDEN_SIZE=$HIDDEN_SIZE"
 
 bash /nas/ucb/juanlievano/pobax_RLC/slurm/dqn_smoke_tests/run_one_dqn.sh

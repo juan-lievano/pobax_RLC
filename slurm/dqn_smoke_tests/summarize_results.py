@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Print a sorted summary table of DQN/DRQN smoke-test results.
 
-Scans results/ for directories whose name contains '_drqn' (or '_dqn' if you
-add memoryless runs later), loads each Orbax checkpoint, and prints one row
-per completed run with the final greedy-eval return.
+Scans results/ for directories whose name contains '_drqn', loads each
+Orbax checkpoint, and prints one row per completed run showing the final
+greedy-eval return alongside the key hyperparameters.
 
 Usage (from repo root):
     python slurm/dqn_smoke_tests/summarize_results.py
@@ -21,7 +21,6 @@ import orbax.checkpoint
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _restore(path: Path) -> dict | None:
-    """Restore an Orbax checkpoint; return None on failure."""
     try:
         return orbax.checkpoint.PyTreeCheckpointer().restore(path)
     except Exception as exc:
@@ -30,7 +29,7 @@ def _restore(path: Path) -> dict | None:
 
 
 def _eval_return(result: dict) -> tuple[float, float, int]:
-    """Extract (mean, std, n_completed) from the final_eval block."""
+    """(mean, std, n_completed) from the saved final_eval block."""
     fe = result.get("final_eval", result.get("final_eval_metric", {}))
     rets = np.asarray(fe.get("returned_episode_returns", []))
     mask = np.asarray(fe.get("returned_episode", []), dtype=bool)
@@ -45,7 +44,14 @@ def _runtime_str(result: dict) -> str:
     if rt is None:
         return "?"
     secs = float(np.asarray(rt).ravel()[0])
-    return f"{secs / 60:.1f} min"
+    return f"{secs / 60:.1f}m"
+
+
+def _scalar(v):
+    """Unwrap a list/array to a plain scalar (sweep hparams are stored as lists)."""
+    if isinstance(v, (list, np.ndarray)):
+        v = np.asarray(v).ravel()[0]
+    return v
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -63,12 +69,9 @@ def main() -> None:
     if not results_root.exists():
         sys.exit(f"ERROR: results dir not found: {results_root}")
 
-    # Collect all run dirs whose study name matches the pattern
     run_dirs = []
     for study_dir in sorted(results_root.iterdir()):
-        if not study_dir.is_dir():
-            continue
-        if args.pattern not in study_dir.name:
+        if not study_dir.is_dir() or args.pattern not in study_dir.name:
             continue
         for run_dir in sorted(study_dir.iterdir()):
             if run_dir.is_dir():
@@ -87,92 +90,65 @@ def main() -> None:
             continue
 
         cfg = result.get("args", {})
-        env       = cfg.get("env", "?")
-        lr        = cfg.get("lr", ["?"])
-        eps_fin   = cfg.get("epsilon_finish", ["?"])
-        memless   = cfg.get("memoryless", False)
-        n_seeds   = cfg.get("n_seeds", "?")
-        tot_steps = cfg.get("total_steps", "?")
-
-        # lr / epsilon_finish are stored as lists (sweep arrays); grab first elem
-        lr_val  = lr[0]  if isinstance(lr,  (list, np.ndarray)) else lr
-        eps_val = eps_fin[0] if isinstance(eps_fin, (list, np.ndarray)) else eps_fin
+        env      = cfg.get("env", "?")
+        lr       = f"{float(_scalar(cfg.get('lr', 0))):.2e}"
+        eps      = f"{float(_scalar(cfg.get('epsilon_finish', 0))):.2f}"
+        tr       = int(_scalar(cfg.get("trace_length", 0)))
+        hs       = int(_scalar(cfg.get("hidden_size", 0)))
+        n_seeds  = cfg.get("n_seeds", "?")
 
         mean_ret, std_ret, n_ep = _eval_return(result)
         rt = _runtime_str(result)
 
         rows.append({
-            "env":       env,
-            "algo":      "DQN" if memless else "DRQN",
-            "lr":        f"{float(lr_val):.2e}",
-            "eps_fin":   f"{float(eps_val):.2f}",
-            "mean_ret":  mean_ret,
-            "std_ret":   std_ret,
-            "n_ep":      n_ep,
-            "seeds":     n_seeds,
-            "steps":     tot_steps,
-            "runtime":   rt,
-            "study":     study_name,
+            "env":      env,
+            "lr":       lr,
+            "eps":      eps,
+            "tr":       tr,
+            "hs":       hs,
+            "mean_ret": mean_ret,
+            "std_ret":  std_ret,
+            "n_ep":     n_ep,
+            "seeds":    n_seeds,
+            "runtime":  rt,
         })
 
     if not rows:
         print("No results could be loaded.")
         return
 
-    # Sort: env, algo, lr, eps
-    rows.sort(key=lambda r: (r["env"], r["algo"], r["lr"], r["eps_fin"]))
+    # Sort: env → lr → eps → trace_length → hidden_size
+    rows.sort(key=lambda r: (r["env"], r["lr"], r["eps"], r["tr"], r["hs"]))
 
     # ── print table ──────────────────────────────────────────────────────────
-    col_w = {
-        "env": max(len(r["env"]) for r in rows),
-        "algo": 4,
-        "lr": 8,
-        "eps": 6,
-        "mean": 10,
-        "std": 8,
-        "n_ep": 6,
-        "rt": 9,
-    }
-
+    env_w = max(len(r["env"]) for r in rows)
     header = (
-        f"{'ENV':<{col_w['env']}}  "
-        f"{'ALGO':<{col_w['algo']}}  "
-        f"{'LR':<{col_w['lr']}}  "
-        f"{'EPS_FIN':<{col_w['eps']}}  "
-        f"{'MEAN_RET':>{col_w['mean']}}  "
-        f"{'STD_RET':>{col_w['std']}}  "
-        f"{'N_EP':>{col_w['n_ep']}}  "
-        f"{'RUNTIME':>{col_w['rt']}}"
+        f"{'ENV':<{env_w}}  {'LR':<8}  {'EPS':>5}  {'TR':>3}  {'HS':>3}  "
+        f"{'MEAN_RET':>10}  {'STD':>8}  {'N_EP':>5}  {'TIME':>7}"
     )
-    sep = "-" * len(header)
+    sep = "─" * len(header)
     print(header)
     print(sep)
 
     prev_env = None
     for r in rows:
         if prev_env and r["env"] != prev_env:
-            print()  # blank line between env groups
+            print()
         prev_env = r["env"]
 
         mean_s = f"{r['mean_ret']:>10.2f}" if not np.isnan(r["mean_ret"]) else f"{'no eps':>10}"
         std_s  = f"{r['std_ret']:>8.2f}"  if not np.isnan(r["std_ret"])  else f"{'':>8}"
 
         print(
-            f"{r['env']:<{col_w['env']}}  "
-            f"{r['algo']:<{col_w['algo']}}  "
-            f"{r['lr']:<{col_w['lr']}}  "
-            f"{r['eps_fin']:<{col_w['eps']}}  "
-            f"{mean_s}  "
-            f"{std_s}  "
-            f"{r['n_ep']:>{col_w['n_ep']}}  "
-            f"{r['runtime']:>{col_w['rt']}}"
+            f"{r['env']:<{env_w}}  {r['lr']:<8}  {r['eps']:>5}  "
+            f"{r['tr']:>3}  {r['hs']:>3}  "
+            f"{mean_s}  {std_s}  {r['n_ep']:>5}  {r['runtime']:>7}"
         )
 
     print(sep)
     print(f"\nTotal runs: {len(rows)}")
-    print("MEAN_RET = mean episodic return across all seeds and eval envs "
-          "(greedy policy, completed episodes only).")
-    print("'no eps' = no episodes completed (greedy policy timed out on all envs).")
+    print("TR=trace_length  HS=hidden_size  N_EP=completed eval episodes")
+    print("MEAN_RET: greedy policy, completed episodes only. 'no eps' = all timed out.")
 
 
 if __name__ == "__main__":

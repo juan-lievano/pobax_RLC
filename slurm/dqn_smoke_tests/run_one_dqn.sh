@@ -2,15 +2,13 @@
 set -euo pipefail
 
 # Expected env vars (set by array_launch_dqn.sh):
-#   ENV_NAME, LR, EPSILON_FINISH, MEMORYLESS
+#   ENV_NAME, LR, EPSILON_FINISH, TRACE_LENGTH, HIDDEN_SIZE
 
 # ---- Fixed constants ----
 NUM_ENVS=32
 N_SEEDS=3
 SEED=2026
-HIDDEN_SIZE=128
 TOTAL_STEPS=2000000
-TRACE_LENGTH=50
 BUFFER_SIZE=100000
 TRAINING_INTERVAL=10
 TARGET_UPDATE_INTERVAL=2000
@@ -38,10 +36,10 @@ echo "Start time:           $(date)"
 echo "ENV_NAME:             $ENV_NAME"
 echo "LR:                   $LR"
 echo "EPSILON_FINISH:       $EPSILON_FINISH"
-echo "MEMORYLESS:           $MEMORYLESS"
+echo "TRACE_LENGTH:         $TRACE_LENGTH"
+echo "HIDDEN_SIZE:          $HIDDEN_SIZE"
 echo "NUM_ENVS:             $NUM_ENVS"
 echo "TOTAL_STEPS:          $TOTAL_STEPS"
-echo "TRACE_LENGTH:         $TRACE_LENGTH"
 echo "BUFFER_SIZE:          $BUFFER_SIZE"
 echo "EPSILON_ANNEAL_TIME:  $EPSILON_ANNEAL_TIME"
 echo "=================="
@@ -52,22 +50,16 @@ python -c "import jax; print(jax.devices()); print('Backend:', jax.default_backe
 echo "--- GPU info ---"
 nvidia-smi --query-gpu=name,memory.total,memory.free,utilization.gpu --format=csv,noheader || true
 
-# ---- Bool flags ----
-BOOL_FLAGS=""
-[[ "$MEMORYLESS" == "true" ]] && BOOL_FLAGS+=" --memoryless"
-
 # ---- Study name ----
 LR_TAG="$(printf "%s" "$LR" | sed 's/\./p/g; s/e-0*/e/g')"
 EPS_TAG="$(printf "%s" "$EPSILON_FINISH" | sed 's/\./p/g')"
-[[ "$MEMORYLESS" == "true" ]] && _ML="_ml" || _ML=""
-STUDY_NAME="${ENV_NAME}_drqn${_ML}_lr${LR_TAG}_eps${EPS_TAG}_s${N_SEEDS}"
+STUDY_NAME="${ENV_NAME}_drqn_lr${LR_TAG}_eps${EPS_TAG}_tr${TRACE_LENGTH}_h${HIDDEN_SIZE}_s${N_SEEDS}"
 
-echo "Running DQN/DRQN: study_name=$STUDY_NAME"
+echo "Running DRQN: study_name=$STUDY_NAME"
 
 CMD=(srun python -m pobax.algos.dqn
   --env "$ENV_NAME"
   --hidden_size "$HIDDEN_SIZE"
-  $BOOL_FLAGS
   --total_steps "$TOTAL_STEPS"
   --num_envs "$NUM_ENVS"
   --trace_length "$TRACE_LENGTH"
