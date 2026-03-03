@@ -8,12 +8,16 @@ set -euo pipefail
 NUM_ENVS=32
 N_SEEDS=1
 SEED=2026
-TOTAL_STEPS=1000000
+TOTAL_STEPS=1000000        # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS = 31250
 BUFFER_SIZE=50000
-TRAINING_INTERVAL=10
-TARGET_UPDATE_INTERVAL=2000
-LEARNING_STARTS=5000
-EPSILON_ANNEAL_TIME=$(( TOTAL_STEPS / 2 ))   # anneal over first half, then exploit
+
+# All schedule params below are in SCAN STEPS (vectorised env steps, +1 per _env_step).
+# 1 scan step = NUM_ENVS individual transitions.
+# To convert from old transition-based values: divide by NUM_ENVS.
+TRAINING_INTERVAL=10       # gradient update every 10 scan steps  (= 320 transitions)
+TARGET_UPDATE_INTERVAL=62  # target copy every 62 scan steps       (= 2000 transitions, same as before)
+LEARNING_STARTS=156        # start learning after 156 scan steps   (= 5000 transitions, same as before)
+EPSILON_ANNEAL_TIME=$(( TOTAL_STEPS / 2 / NUM_ENVS ))  # anneal over first half of scan steps (~15625)
 NUM_EVAL_ENVS=64
 PLATFORM=gpu
 
