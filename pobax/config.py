@@ -100,10 +100,10 @@ class DQNHyperparams(Tap):
     buffer_size: int = 10000
     buffer_batch_size: int = 128
     epsilon_start: float = 1.
-    epsilon_anneal_time: int = int(25e4)
+    epsilon_anneal_time: int = int(1e5)
     training_interval: int = 10
     target_update_interval: int = 500
-    learning_starts: int = 10000
+    learning_starts: int = 1000
     tau: float = 1.
     trace_length: int = 20  # DRQN sequence training length
 

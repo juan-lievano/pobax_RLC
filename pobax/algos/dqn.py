@@ -88,7 +88,9 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                          memoryless=args.memoryless,
                          is_image=is_image)
 
-    num_updates = args.total_steps // args.training_interval
+    num_updates = args.total_steps // args.num_envs  # scan steps; each step = 1 env step per env
+    # Expected number of gradient updates (for LR annealing)
+    expected_gradient_updates = args.total_steps // (args.num_envs * args.training_interval)
 
     # --- Dummy timestep shape (single sample, no batch or time dims) ---
     obs_dim = env.observation_space(env_params).spaces['obs'].shape
@@ -139,7 +141,7 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
 
         if args.anneal_lr:
             def linear_schedule(count):
-                frac = 1.0 - count / num_updates
+                frac = 1.0 - count / expected_gradient_updates
                 return lr * frac
             tx = optax.chain(
                 optax.clip_by_global_norm(args.max_grad_norm),
@@ -223,7 +225,10 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                 next_obs_in = Observation(obs=next_obs_tb)
 
                 def loss_fn(params):
-                    _, q_vals = network.apply(params, init_h, (obs_in, done_tb))
+                    # obs[t] starts a new episode when done[t-1]=1, so shift done right by 1.
+                    # next_obs[t] = obs[t+1] starts a new episode when done[t]=1, so done_tb is correct as-is.
+                    done_for_obs_tb = jnp.concatenate([jnp.zeros((1, B)), done_tb[:-1]], axis=0)
+                    _, q_vals = network.apply(params, init_h, (obs_in, done_for_obs_tb))
                     # q_vals: [T, B, A]
                     _, q_next = network.apply(train_state.target_network_params, init_h,
                                               (next_obs_in, done_tb))
@@ -291,9 +296,15 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             buffer_state = buffer_add(buffer_state, timestep_buffered)
 
             # Conditionally learn
+            # Use floor-division crossing to avoid lcm(num_envs, interval) skew:
+            # "did we step across a multiple of training_interval this env step?"
+            prev_t = train_state.timesteps - args.num_envs
             can_learn = jnp.logical_and(
                 buffer_can_sample(buffer_state),
-                train_state.timesteps % args.training_interval == 0,
+                jnp.logical_and(
+                    train_state.timesteps >= args.learning_starts,
+                    (train_state.timesteps // args.training_interval) > (prev_t // args.training_interval),
+                ),
             )
             rng, rng_learn = jax.random.split(rng)
 
@@ -305,13 +316,23 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             )
 
             # Conditionally update target network
-            do_target_update = train_state.timesteps % args.target_update_interval == 0
+            do_target_update = (train_state.timesteps // args.target_update_interval) > (prev_t // args.target_update_interval)
             train_state = jax.lax.cond(
                 do_target_update,
                 _update_target,
                 lambda ts: ts,
                 train_state,
             )
+
+            if args.debug:
+                def callback(info, timesteps):
+                    returned = info["returned_episode"]
+                    avg_return = jnp.mean(
+                        info["returned_episode_returns"][returned]
+                    )
+                    if returned.any():
+                        print(f"timesteps={timesteps}, avg_episodic_return={avg_return:.2f}")
+                jax.debug.callback(callback, info, train_state.timesteps)
 
             runner_state = (train_state, buffer_state, env_state, obsv, done, new_hstate, rng)
             return runner_state, info
@@ -361,9 +382,9 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
         final_train_state = runner_state[0]
 
         rng, _rng = jax.random.split(runner_state[-1])
-        reset_rng = jax.random.split(_rng, args.num_envs)
+        reset_rng = jax.random.split(_rng, args.num_eval_envs)
         eval_obsv, eval_env_state = env.reset(reset_rng, env_params)
-        eval_hstate = ScannedRNN.initialize_carry(args.num_envs, args.hidden_size)
+        eval_hstate = ScannedRNN.initialize_carry(args.num_eval_envs, args.hidden_size)
 
         def _eval_step(eval_runner_state, unused):
             ts, es, obs, done, hs, rng_ = eval_runner_state
@@ -374,12 +395,12 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             )
             new_hs, q_vals = network.apply(ts.params, hs, ac_in)
             action = jnp.argmax(q_vals.squeeze(0), axis=-1)
-            rng_steps = jax.random.split(rng_step, args.num_envs)
+            rng_steps = jax.random.split(rng_step, args.num_eval_envs)
             next_obs, next_es, reward, next_done, info = env.step(rng_steps, es, action, env_params)
             return (ts, next_es, next_obs, next_done, new_hs, rng_), info
 
         eval_runner_state = (final_train_state, eval_env_state, eval_obsv,
-                             jnp.zeros(args.num_envs, dtype=bool), eval_hstate, _rng)
+                             jnp.zeros(args.num_eval_envs, dtype=bool), eval_hstate, _rng)
         _, eval_traj_info = jax.lax.scan(
             _eval_step, eval_runner_state, None, env_params.max_steps_in_episode
         )
