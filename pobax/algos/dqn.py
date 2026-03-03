@@ -37,7 +37,8 @@ class TimeStep(NamedTuple):
 
 class DQNTrainState(TrainState):
     target_network_params: flax.core.FrozenDict
-    timesteps: int
+    timesteps: int   # total transitions collected (+num_envs per step), kept for logging
+    env_steps: int   # vectorised env steps (+1 per _env_step); used for all schedules
     n_updates: int
 
 
@@ -45,14 +46,14 @@ class DQNTrainState(TrainState):
 # Epsilon-greedy exploration
 # ---------------------------------------------------------------------------
 
-def eps_greedy_action(rng, q_vals, timesteps, epsilon_finish, args):
-    """Linear epsilon schedule; greedy arg-max otherwise."""
+def eps_greedy_action(rng, q_vals, env_steps, epsilon_finish, args):
+    """Linear epsilon schedule keyed off vectorised env_steps (scan steps)."""
     epsilon = jnp.where(
-        timesteps < args.learning_starts,
+        env_steps < args.learning_starts,
         args.epsilon_start,
         jnp.clip(
             args.epsilon_start + (epsilon_finish - args.epsilon_start)
-            * (timesteps - args.learning_starts) / args.epsilon_anneal_time,
+            * (env_steps - args.learning_starts) / args.epsilon_anneal_time,
             epsilon_finish,
             args.epsilon_start,
         ),
@@ -88,9 +89,58 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                          memoryless=args.memoryless,
                          is_image=is_image)
 
-    num_updates = args.total_steps // args.num_envs  # scan steps; each step = 1 env step per env
-    # Expected number of gradient updates (for LR annealing)
-    expected_gradient_updates = args.total_steps // (args.num_envs * args.training_interval)
+    num_updates = args.total_steps // args.num_envs  # total scan steps
+    # Gradient updates only fire after learning_starts, so the optimizer step counter
+    # runs from 0 to (num_updates - learning_starts) // training_interval.
+    # Using num_updates here instead would cause LR to decay too slowly (schedule
+    # calibrated for more updates than will actually happen).
+    effective_train_steps = num_updates - args.learning_starts
+    expected_gradient_updates = max(1, effective_train_steps // args.training_interval)
+
+    # --- Static schedule sanity checks (all values in SCAN STEPS = +1 per _env_step) ---
+    # These run before JIT compilation and will raise immediately if misconfigured.
+    assert args.learning_starts >= 0, (
+        f"learning_starts must be >= 0, got {args.learning_starts}"
+    )
+    assert args.learning_starts < num_updates, (
+        f"learning_starts ({args.learning_starts} scan steps) >= total scan steps ({num_updates}). "
+        f"Training will never start! Reduce learning_starts or increase total_steps/num_envs."
+    )
+    assert args.training_interval >= 1, (
+        f"training_interval must be >= 1, got {args.training_interval}"
+    )
+    assert args.target_update_interval >= 1, (
+        f"target_update_interval must be >= 1, got {args.target_update_interval}"
+    )
+    assert args.epsilon_anneal_time >= 1, (
+        f"epsilon_anneal_time must be >= 1, got {args.epsilon_anneal_time}"
+    )
+
+    # Warn if epsilon won't fully anneal before training ends.
+    if args.epsilon_anneal_time > effective_train_steps:
+        print(
+            f"[DQN] WARNING: epsilon_anneal_time ({args.epsilon_anneal_time} scan steps) > "
+            f"effective training steps ({effective_train_steps} = num_updates - learning_starts). "
+            f"Epsilon will NOT reach epsilon_finish before training ends."
+        )
+
+    # Schedule summary — appears in SLURM logs to confirm all params are in the right units.
+    # UNIT: all schedule params are SCAN STEPS (+1 per _env_step, i.e. per call to _env_step).
+    #       1 scan step = num_envs individual transitions.
+    print(
+        f"\n[DQN] Schedule summary (scan steps; 1 scan step = {args.num_envs} transitions):\n"
+        f"  total scan steps         : {num_updates:>10,}\n"
+        f"  learning_starts          : {args.learning_starts:>10,}  "
+        f"({args.learning_starts * args.num_envs:,} transitions)\n"
+        f"  training_interval        : every {args.training_interval:,} steps  "
+        f"({args.training_interval * args.num_envs:,} transitions)\n"
+        f"  target_update_interval   : every {args.target_update_interval:,} steps  "
+        f"({args.target_update_interval * args.num_envs:,} transitions)\n"
+        f"  epsilon_anneal_time      : {args.epsilon_anneal_time:>10,}  "
+        f"({args.epsilon_anneal_time * args.num_envs:,} transitions)\n"
+        f"  expected_gradient_updates: {expected_gradient_updates:>10,}\n"
+        f"  expected_target_updates  : {effective_train_steps // args.target_update_interval:>10,}\n"
+    )
 
     # --- Dummy timestep shape (single sample, no batch or time dims) ---
     obs_dim = env.observation_space(env_params).spaces['obs'].shape
@@ -142,7 +192,7 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
         if args.anneal_lr:
             def linear_schedule(count):
                 frac = 1.0 - count / expected_gradient_updates
-                return lr * frac
+                return lr * jnp.maximum(frac, 0.0)  # clamp: never let LR go negative
             tx = optax.chain(
                 optax.clip_by_global_norm(args.max_grad_norm),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
@@ -159,6 +209,7 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             tx=tx,
             target_network_params=network_params,
             timesteps=0,
+            env_steps=0,
             n_updates=0,
         )
 
@@ -187,6 +238,19 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                 reward = ts.reward                              # [B]
                 done = ts.done.astype(jnp.float32)             # [B]
                 B = obs.shape[0]
+
+                # Shape assertions — static checks (JAX shapes are concrete at trace time).
+                # DQN flat buffer: experience.first is a TimeStep with leaves [B, *leaf_shape].
+                assert obs.ndim == 2, (
+                    f"DQN: expected obs [B, obs_dim], got {obs.shape}. "
+                    f"Did the flat buffer wrap in an extra dimension?"
+                )
+                assert obs.shape[0] == args.buffer_batch_size, (
+                    f"DQN: batch size mismatch: expected {args.buffer_batch_size}, got {obs.shape[0]}"
+                )
+                assert action.ndim == 1 and action.shape[0] == args.buffer_batch_size, (
+                    f"DQN: action shape mismatch: expected [{args.buffer_batch_size}], got {action.shape}"
+                )
 
                 dummy_h = ScannedRNN.initialize_carry(B, args.hidden_size)
                 obs_in = Observation(obs=obs[None])         # [1, B, obs_dim]
@@ -219,6 +283,33 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                 done_tb = jnp.transpose(done, (1, 0))            # [T, B]
                 action_tb = jnp.transpose(action, (1, 0))        # [T, B]
                 reward_tb = jnp.transpose(reward, (1, 0))        # [T, B]
+
+                # Shape assertions — static checks (JAX shapes are concrete at trace time).
+                # Trajectory buffer: experience leaves are [B, T, *leaf_shape].
+                assert obs.ndim == 3, (
+                    f"DRQN: expected obs [B, T, obs_dim], got {obs.shape}. "
+                    f"Did the trajectory buffer add/sample change shape contract?"
+                )
+                assert obs.shape[0] == args.buffer_batch_size, (
+                    f"DRQN: batch size mismatch: expected {args.buffer_batch_size}, got {obs.shape[0]}"
+                )
+                assert obs.shape[1] == args.trace_length, (
+                    f"DRQN: trace length mismatch: expected {args.trace_length}, got {obs.shape[1]}. "
+                    f"Check sample_sequence_length in fbx.make_trajectory_buffer."
+                )
+                # After transpose to [T, B, *]:
+                assert obs_tb.shape == (args.trace_length, args.buffer_batch_size, *obs_dim), (
+                    f"DRQN: obs_tb shape mismatch: expected "
+                    f"{(args.trace_length, args.buffer_batch_size, *obs_dim)}, got {obs_tb.shape}"
+                )
+                assert done_tb.shape == (args.trace_length, args.buffer_batch_size), (
+                    f"DRQN: done_tb shape mismatch: expected "
+                    f"({args.trace_length}, {args.buffer_batch_size}), got {done_tb.shape}"
+                )
+                assert action_tb.shape == (args.trace_length, args.buffer_batch_size), (
+                    f"DRQN: action_tb shape mismatch: expected "
+                    f"({args.trace_length}, {args.buffer_batch_size}), got {action_tb.shape}"
+                )
 
                 init_h = ScannedRNN.initialize_carry(B, args.hidden_size)
                 obs_in = Observation(obs=obs_tb)
@@ -268,15 +359,21 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             new_hstate, q_vals = network.apply(train_state.params, hstate, ac_in)
             q_vals_squeezed = q_vals.squeeze(0)  # [num_envs, action_dim]
 
+            # Snapshot env_steps BEFORE this step for interval crossing checks.
+            prev_env_steps = train_state.env_steps
+
             action = eps_greedy_action(rng_act, q_vals_squeezed,
-                                       train_state.timesteps, epsilon_finish, args)
+                                       prev_env_steps, epsilon_finish, args)
 
             # Step env
             rng_steps = jax.random.split(rng_step, args.num_envs)
             obsv, env_state, reward, done, info = env.step(rng_steps, env_state, action, env_params)
 
-            # Update timestep counter
-            train_state = train_state.replace(timesteps=train_state.timesteps + args.num_envs)
+            # Update counters: env_steps counts scan steps (+1), timesteps counts transitions (+num_envs).
+            train_state = train_state.replace(
+                timesteps=train_state.timesteps + args.num_envs,
+                env_steps=train_state.env_steps + 1,
+            )
 
             # Build transition (cast to buffer dtypes)
             timestep = TimeStep(
@@ -295,15 +392,13 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
 
             buffer_state = buffer_add(buffer_state, timestep_buffered)
 
-            # Conditionally learn
-            # Use floor-division crossing to avoid lcm(num_envs, interval) skew:
-            # "did we step across a multiple of training_interval this env step?"
-            prev_t = train_state.timesteps - args.num_envs
+            # Conditionally learn – all schedule parameters are in env_steps (scan steps).
+            # "did env_steps just cross a multiple of training_interval?"
             can_learn = jnp.logical_and(
                 buffer_can_sample(buffer_state),
                 jnp.logical_and(
-                    train_state.timesteps >= args.learning_starts,
-                    (train_state.timesteps // args.training_interval) > (prev_t // args.training_interval),
+                    train_state.env_steps >= args.learning_starts,
+                    (train_state.env_steps // args.training_interval) > (prev_env_steps // args.training_interval),
                 ),
             )
             rng, rng_learn = jax.random.split(rng)
@@ -316,7 +411,7 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
             )
 
             # Conditionally update target network
-            do_target_update = (train_state.timesteps // args.target_update_interval) > (prev_t // args.target_update_interval)
+            do_target_update = (train_state.env_steps // args.target_update_interval) > (prev_env_steps // args.target_update_interval)
             train_state = jax.lax.cond(
                 do_target_update,
                 _update_target,
@@ -333,6 +428,41 @@ def make_train(args: DQNHyperparams, rand_key: jax.random.PRNGKey):
                     if returned.any():
                         print(f"timesteps={timesteps}, avg_episodic_return={avg_return:.2f}")
                 jax.debug.callback(callback, info, train_state.timesteps)
+
+                def _interval_callback(env_steps, prev_env_steps, timesteps,
+                                       can_learn, do_target_update):
+                    # Verify env_steps increments by exactly 1 each scan step.
+                    # This catches any regression where the wrong counter is incremented.
+                    inc = int(env_steps) - int(prev_env_steps)
+                    if inc != 1:
+                        print(
+                            f"[DQN BUG] env_steps increment={inc} (expected 1). "
+                            f"env_steps={env_steps}, prev_env_steps={prev_env_steps}"
+                        )
+                    # Verify timesteps increments by num_envs each scan step.
+                    ts_inc = int(timesteps) - int(prev_env_steps) * args.num_envs
+                    # (timesteps = env_steps * num_envs by construction)
+                    expected_ts = int(env_steps) * args.num_envs
+                    if int(timesteps) != expected_ts:
+                        print(
+                            f"[DQN BUG] timesteps={timesteps} != env_steps*num_envs "
+                            f"({int(env_steps)}*{args.num_envs}={expected_ts}). "
+                            f"Counter mismatch — likely incremented with wrong value."
+                        )
+                    # Log interval events and periodic snapshots.
+                    # This lets you verify modular arithmetic fires at the right rate.
+                    if bool(can_learn) or bool(do_target_update) or int(env_steps) % 1000 == 0:
+                        print(
+                            f"[DQN] env_steps={int(env_steps):6d} "
+                            f"(transitions={int(timesteps):8d}): "
+                            f"can_learn={bool(can_learn)}, "
+                            f"do_target_update={bool(do_target_update)}"
+                        )
+                jax.debug.callback(
+                    _interval_callback,
+                    train_state.env_steps, prev_env_steps,
+                    train_state.timesteps, can_learn, do_target_update,
+                )
 
             runner_state = (train_state, buffer_state, env_state, obsv, done, new_hstate, rng)
             return runner_state, info
