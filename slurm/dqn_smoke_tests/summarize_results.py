@@ -65,7 +65,7 @@ def main() -> None:
                     help="Substring to filter study-name directories (default: '_drqn')")
     args = ap.parse_args()
 
-    results_root = Path(args.results_dir)
+    results_root = Path(args.results_dir).resolve()
     if not results_root.exists():
         sys.exit(f"ERROR: results dir not found: {results_root}")
 
