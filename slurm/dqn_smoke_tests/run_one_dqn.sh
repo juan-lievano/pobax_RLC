@@ -8,8 +8,8 @@ set -euo pipefail
 NUM_ENVS=32
 N_SEEDS=1
 SEED=2026
-TOTAL_STEPS=1000000        # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS = 31250
-BUFFER_SIZE=50000
+TOTAL_STEPS=5000000        # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS = 156250
+BUFFER_SIZE=200000
 
 # All schedule params below are in SCAN STEPS (vectorised env steps, +1 per _env_step).
 # 1 scan step = NUM_ENVS individual transitions.
