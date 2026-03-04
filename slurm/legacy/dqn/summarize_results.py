@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Print a sorted summary table of DQN/DRQN experiment results.
 
-Scans results/ for directories whose name contains the given pattern, loads
-each Orbax checkpoint, and prints one row per completed run.
+Scans results/ at two directory depths, loads every valid Orbax checkpoint
+whose saved args identify it as a DQN run (algo == 'dqn'), and prints one
+row per run.  Invalid or old-format checkpoints are silently skipped.
 
 Usage (from repo root):
-    python slurm/dqn_smoke_tests/summarize_results.py
-    python slurm/dqn_smoke_tests/summarize_results.py --results_dir /path/to/results
-    python slurm/dqn_smoke_tests/summarize_results.py --pattern _drqn   # old smoke-test runs
+    python slurm/dqn/summarize_results.py
+    python slurm/dqn/summarize_results.py --results_dir /path/to/results
+    python slurm/dqn/summarize_results.py --pattern rocksample
+    python slurm/dqn/summarize_results.py --verbose   # show load errors
 """
 import argparse
 import sys
@@ -19,11 +21,12 @@ import orbax.checkpoint
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _restore(path: Path) -> dict | None:
+def _restore(path: Path, verbose: bool) -> dict | None:
     try:
         return orbax.checkpoint.PyTreeCheckpointer().restore(path)
     except Exception as exc:
-        print(f"  [WARN] could not load {path}: {exc}", file=sys.stderr)
+        if verbose:
+            print(f"  [WARN] could not load {path}: {exc}", file=sys.stderr)
         return None
 
 
@@ -46,11 +49,22 @@ def _runtime_str(result: dict) -> str:
     return f"{secs / 60:.1f}m"
 
 
-def _scalar(v):
-    """Unwrap a list/array to a plain scalar (sweep hparams are stored as lists)."""
+def _scalar(v, default=0):
     if isinstance(v, (list, np.ndarray)):
-        v = np.asarray(v).ravel()[0]
-    return v
+        arr = np.asarray(v).ravel()
+        return arr[0] if arr.size > 0 else default
+    return v if v is not None else default
+
+
+def _candidate_dirs(results_root: Path):
+    """Yield directories to try loading as Orbax checkpoints (depth 1 and 2)."""
+    for d1 in sorted(results_root.iterdir()):
+        if not d1.is_dir():
+            continue
+        yield d1
+        for d2 in sorted(d1.iterdir()):
+            if d2.is_dir() and not d2.name.startswith("checkpoint_"):
+                yield d2
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -60,42 +74,38 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results_dir", default="results",
                     help="Root results directory (default: results/)")
-    ap.add_argument("--pattern", default="dqn_",
-                    help="Substring to filter study-name directories (default: 'dqn_')")
+    ap.add_argument("--pattern", default="",
+                    help="Only include runs whose env name contains this substring.")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print warnings for unreadable checkpoints.")
     args = ap.parse_args()
 
     results_root = Path(args.results_dir).resolve()
     if not results_root.exists():
         sys.exit(f"ERROR: results dir not found: {results_root}")
 
-    run_dirs = []
-    for study_dir in sorted(results_root.iterdir()):
-        if not study_dir.is_dir() or args.pattern not in study_dir.name:
-            continue
-        for run_dir in sorted(study_dir.iterdir()):
-            if run_dir.is_dir():
-                run_dirs.append((study_dir.name, run_dir))
-
-    if not run_dirs:
-        sys.exit(f"No matching run directories found under {results_root} "
-                 f"with pattern '{args.pattern}'.")
-
-    print(f"\nFound {len(run_dirs)} run(s) matching '{args.pattern}' in {results_root}\n")
-
     rows = []
-    for _study_name, run_dir in run_dirs:
-        result = _restore(run_dir)
+    for candidate in _candidate_dirs(results_root):
+        result = _restore(candidate, args.verbose)
         if result is None:
             continue
 
         cfg = result.get("args", {})
-        env        = cfg.get("env", "?")
-        lr         = f"{float(_scalar(cfg.get('lr', 0))):.2e}"
-        tr         = int(_scalar(cfg.get("trace_length", 0)))
-        hs         = int(_scalar(cfg.get("hidden_size", 0)))
-        num_envs   = int(_scalar(cfg.get("num_envs", 32)))
-        bbs        = int(_scalar(cfg.get("buffer_batch_size", 128)))
-        memoryless = bool(_scalar(cfg.get("memoryless", False)))
+        if not cfg or not cfg.get("env"):
+            continue  # not a recognised run checkpoint
+        if cfg.get("algo", "ppo") != "dqn":
+            continue  # skip non-DQN runs
+
+        env = str(cfg.get("env", "?"))
+        if args.pattern and args.pattern not in env:
+            continue
+
+        lr         = f"{float(_scalar(cfg.get('lr'), 0)):.2e}"
+        tr         = int(_scalar(cfg.get("trace_length"), 0))
+        hs         = int(_scalar(cfg.get("hidden_size"), 0))
+        num_envs   = int(_scalar(cfg.get("num_envs"), 32))
+        bbs        = int(_scalar(cfg.get("buffer_batch_size"), 128))
+        memoryless = bool(_scalar(cfg.get("memoryless"), False))
 
         mean_ret, std_ret, n_ep = _eval_return(result)
         rt = _runtime_str(result)
@@ -115,13 +125,12 @@ def main() -> None:
         })
 
     if not rows:
-        print("No results could be loaded.")
-        return
+        sys.exit(f"No DQN results found under {results_root}.")
 
-    # Sort: env → memoryless → lr → tr → hs → num_envs → buffer_batch_size
+    print(f"\nFound {len(rows)} DQN run(s) in {results_root}\n")
+
     rows.sort(key=lambda r: (r["env"], r["mem"], r["lr"], r["tr"], r["hs"], r["ne"], r["bbs"]))
 
-    # ── print table ──────────────────────────────────────────────────────────
     env_w = max(len(r["env"]) for r in rows)
     header = (
         f"{'ENV':<{env_w}}  {'MODE':>4}  {'LR':<8}  {'TR':>3}  {'HS':>3}  "

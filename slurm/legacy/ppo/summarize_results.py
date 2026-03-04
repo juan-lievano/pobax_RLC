@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Print a sorted summary table of PPO experiment results.
 
-Scans results/ for directories whose name contains the given pattern, loads
-each Orbax checkpoint, and prints one row per completed run.
+Scans results/ at two directory depths, loads every valid Orbax checkpoint
+whose saved args identify it as a PPO run (algo != 'dqn'), and prints one
+row per run.  Invalid or old-format checkpoints are silently skipped.
 
 Usage (from repo root):
     python slurm/ppo/summarize_results.py
     python slurm/ppo/summarize_results.py --results_dir /path/to/results
     python slurm/ppo/summarize_results.py --pattern compass_world_8
+    python slurm/ppo/summarize_results.py --verbose   # show load errors
 """
 import argparse
 import sys
@@ -19,16 +21,16 @@ import orbax.checkpoint
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _restore(path: Path) -> dict | None:
+def _restore(path: Path, verbose: bool) -> dict | None:
     try:
         return orbax.checkpoint.PyTreeCheckpointer().restore(path)
     except Exception as exc:
-        print(f"  [WARN] could not load {path}: {exc}", file=sys.stderr)
+        if verbose:
+            print(f"  [WARN] could not load {path}: {exc}", file=sys.stderr)
         return None
 
 
 def _eval_return(result: dict) -> tuple[float, float, int]:
-    """(mean, std, n_completed) from the saved final_eval block."""
     fe = result.get("final_eval", result.get("final_eval_metric", {}))
     rets = np.asarray(fe.get("returned_episode_returns", []))
     mask = np.asarray(fe.get("returned_episode", []), dtype=bool)
@@ -46,11 +48,22 @@ def _runtime_str(result: dict) -> str:
     return f"{secs / 60:.1f}m"
 
 
-def _scalar(v):
-    """Unwrap a list/array to a plain scalar (sweep hparams are stored as lists)."""
+def _scalar(v, default=0):
     if isinstance(v, (list, np.ndarray)):
-        v = np.asarray(v).ravel()[0]
-    return v
+        arr = np.asarray(v).ravel()
+        return arr[0] if arr.size > 0 else default
+    return v if v is not None else default
+
+
+def _candidate_dirs(results_root: Path):
+    """Yield directories to try loading as Orbax checkpoints (depth 1 and 2)."""
+    for d1 in sorted(results_root.iterdir()):
+        if not d1.is_dir():
+            continue
+        yield d1
+        for d2 in sorted(d1.iterdir()):
+            if d2.is_dir() and not d2.name.startswith("checkpoint_"):
+                yield d2
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -61,78 +74,57 @@ def main() -> None:
     ap.add_argument("--results_dir", default="results",
                     help="Root results directory (default: results/)")
     ap.add_argument("--pattern", default="",
-                    help="Substring to filter study-name directories "
-                         "(default: '' = all non-DQN dirs)")
+                    help="Only include runs whose env name contains this substring.")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print warnings for unreadable checkpoints.")
     args = ap.parse_args()
 
     results_root = Path(args.results_dir).resolve()
     if not results_root.exists():
         sys.exit(f"ERROR: results dir not found: {results_root}")
 
-    run_dirs = []
-    for study_dir in sorted(results_root.iterdir()):
-        if not study_dir.is_dir():
-            continue
-        # Skip DQN results
-        if study_dir.name.startswith("dqn_"):
-            continue
-        if args.pattern and args.pattern not in study_dir.name:
-            continue
-        # Each PPO study dir contains one timestamped subdir
-        subdirs = [d for d in study_dir.iterdir() if d.is_dir()
-                   and not d.name.startswith("checkpoint_")]
-        for sub in subdirs:
-            run_dirs.append((study_dir.name, sub))
-
-    if not run_dirs:
-        sys.exit(f"No matching PPO run directories found under {results_root}.")
-
-    print(f"\nFound {len(run_dirs)} PPO run(s) in {results_root}\n")
-
     rows = []
-    for _study_name, run_dir in run_dirs:
-        result = _restore(run_dir)
+    for candidate in _candidate_dirs(results_root):
+        result = _restore(candidate, args.verbose)
         if result is None:
             continue
 
         cfg = result.get("args", {})
-        env        = cfg.get("env", "?")
-        lr         = f"{float(_scalar(cfg.get('lr', 0))):.2e}"
-        hs         = int(_scalar(cfg.get("hidden_size", 0)))
-        dc         = bool(_scalar(cfg.get("double_critic", False)))
-        ml         = bool(_scalar(cfg.get("memoryless", False)))
-        ac         = bool(_scalar(cfg.get("action_concat", False)))
-        ent        = f"{float(_scalar(cfg.get('entropy_coeff', 0))):.3f}"
-        ts         = int(_scalar(cfg.get("total_steps", 0)))
-        n_seeds    = int(_scalar(cfg.get("n_seeds", 1)))
+        if not cfg or not cfg.get("env"):
+            continue  # not a recognised run checkpoint
+        if cfg.get("algo", "ppo") == "dqn":
+            continue  # skip DQN runs
+
+        env = str(cfg.get("env", "?"))
+        if args.pattern and args.pattern not in env:
+            continue
+
+        lr      = f"{float(_scalar(cfg.get('lr'), 0)):.2e}"
+        hs      = int(_scalar(cfg.get("hidden_size"), 0))
+        dc      = bool(_scalar(cfg.get("double_critic"), False))
+        ml      = bool(_scalar(cfg.get("memoryless"), False))
+        ac      = bool(_scalar(cfg.get("action_concat"), False))
+        ent     = f"{float(_scalar(cfg.get('entropy_coeff'), 0)):.3f}"
+        ts      = int(_scalar(cfg.get("total_steps"), 0))
+        n_seeds = int(_scalar(cfg.get("n_seeds"), 1))
 
         mean_ret, std_ret, n_ep = _eval_return(result)
         rt = _runtime_str(result)
 
         rows.append({
-            "env":      env,
-            "lr":       lr,
-            "hs":       hs,
-            "dc":       dc,
-            "ml":       ml,
-            "ac":       ac,
-            "ent":      ent,
-            "ts":       ts,
-            "ns":       n_seeds,
-            "mean_ret": mean_ret,
-            "std_ret":  std_ret,
-            "n_ep":     n_ep,
-            "runtime":  rt,
+            "env": env, "lr": lr, "hs": hs, "dc": dc, "ml": ml,
+            "ac": ac, "ent": ent, "ts": ts, "ns": n_seeds,
+            "mean_ret": mean_ret, "std_ret": std_ret, "n_ep": n_ep,
+            "runtime": rt,
         })
 
     if not rows:
-        print("No results could be loaded.")
-        return
+        sys.exit(f"No PPO results found under {results_root}.")
 
-    # Sort: env → ml → dc → ac → ent → lr → hs
+    print(f"\nFound {len(rows)} PPO run(s) in {results_root}\n")
+
     rows.sort(key=lambda r: (r["env"], r["ml"], r["dc"], r["ac"], r["ent"], r["lr"], r["hs"]))
 
-    # ── print table ──────────────────────────────────────────────────────────
     env_w = max(len(r["env"]) for r in rows)
     header = (
         f"{'ENV':<{env_w}}  {'MODE':>6}  {'LR':<8}  {'HS':>3}  "
@@ -154,7 +146,7 @@ def main() -> None:
         std_s  = f"{r['std_ret']:>8.2f}"  if not np.isnan(r["std_ret"])  else f"{'':>8}"
         dc_s   = "Y" if r["dc"] else "N"
         ac_s   = "Y" if r["ac"] else "N"
-        ts_s   = f"{r['ts'] / 1e6:.0f}M"
+        ts_s   = f"{r['ts'] / 1e6:.0f}M" if r["ts"] > 0 else "?"
 
         print(
             f"{r['env']:<{env_w}}  {mode_s:>6}  {r['lr']:<8}  {r['hs']:>3}  "
