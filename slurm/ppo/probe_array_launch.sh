@@ -17,11 +17,11 @@
 
 set -euo pipefail
 
-GRID_FILE="/nas/ucb/juanlievano/pobax_RLC/slurm/grid.tsv"
+GRID_FILE="/nas/ucb/juanlievano/pobax_RLC/slurm/ppo/grid.tsv"
 
 if [[ ! -f "$GRID_FILE" ]]; then
   echo "ERROR: grid file not found at $GRID_FILE"
-  echo "Did you run: python slurm/make_grid.py  (from repo root)?"
+  echo "Did you run: python slurm/ppo/make_grid.py  (from repo root)?"
   exit 1
 fi
 
@@ -48,4 +48,4 @@ echo "  DOUBLE_CRITIC=$DOUBLE_CRITIC"
 echo "  MEMORYLESS=$MEMORYLESS"
 echo "  ENTROPY_COEFF=$ENTROPY_COEFF"
 
-bash /nas/ucb/juanlievano/pobax_RLC/slurm/probe_run_one.sh
+bash /nas/ucb/juanlievano/pobax_RLC/slurm/ppo/probe_run_one.sh

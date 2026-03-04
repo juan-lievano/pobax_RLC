@@ -115,6 +115,7 @@ def main():
     env_name      = str(run_args["env"])
     hidden_size   = int(run_args["hidden_size"])
     n_seeds       = int(run_args["n_seeds"])
+    algo          = str(run_args.get("algo", "ppo"))
     double_critic = bool(run_args.get("double_critic", False))
     memoryless    = bool(run_args.get("memoryless", False))
     action_concat = bool(run_args.get("action_concat", False))
@@ -127,11 +128,16 @@ def main():
         except (TypeError, ValueError):
             return default
 
-    entropy_coeff = _scalar(run_args.get("entropy_coeff"), float, 0.0)
-    total_steps   = _scalar(run_args.get("total_steps"),   int,   0)
+    entropy_coeff    = _scalar(run_args.get("entropy_coeff"),    float, 0.0)
+    total_steps      = _scalar(run_args.get("total_steps"),      int,   0)
+    # DQN-specific (safe defaults for PPO runs)
+    lr               = _scalar(run_args.get("lr"),               float, 0.0)
+    trace_length     = _scalar(run_args.get("trace_length"),     int,   0)
+    buffer_batch_size = _scalar(run_args.get("buffer_batch_size"), int, 0)
+    num_envs         = _scalar(run_args.get("num_envs"),         int,   0)
 
     print(
-        f"  env={env_name}, hidden_size={hidden_size}, "
+        f"  algo={algo}, env={env_name}, hidden_size={hidden_size}, "
         f"n_seeds={n_seeds}, double_critic={double_critic}, "
         f"memoryless={memoryless}, action_concat={action_concat}, "
         f"entropy_coeff={entropy_coeff}, total_steps={total_steps}"
@@ -139,15 +145,21 @@ def main():
 
     # Save a run_config.json so visualize.py can label figures when run standalone
     config = {
-        "env_name":      env_name,
-        "hidden_size":   hidden_size,
-        "n_seeds":       n_seeds,
-        "double_critic": double_critic,
-        "memoryless":    memoryless,
-        "action_concat": action_concat,
-        "entropy_coeff": entropy_coeff,
-        "total_steps":   total_steps,
-        "h_idx":         args.h_idx,
+        "algo":             algo,
+        "env_name":         env_name,
+        "hidden_size":      hidden_size,
+        "n_seeds":          n_seeds,
+        "double_critic":    double_critic,
+        "memoryless":       memoryless,
+        "action_concat":    action_concat,
+        "entropy_coeff":    entropy_coeff,
+        "total_steps":      total_steps,
+        "h_idx":            args.h_idx,
+        # DQN-specific (zero for PPO runs)
+        "lr":               lr,
+        "trace_length":     trace_length,
+        "buffer_batch_size": buffer_batch_size,
+        "num_envs":         num_envs,
     }
     config_path = out_dir / "run_config.json"
     with open(config_path, "w") as f:
@@ -159,9 +171,10 @@ def main():
     # -----------------------------------------------------------------------
     ckpt_dirs = _discover_checkpoints(run_dir)
     if not ckpt_dirs:
-        print(f"No checkpoint_* directories found in {run_dir}. Exiting.")
+        print(f"No checkpoint_* directories found in {run_dir}. "
+              f"Re-run training with --save_checkpoints to enable probing. Exiting.")
         return
-    print(f"Found {len(ckpt_dirs)} checkpoints.")
+    print(f"Found {len(ckpt_dirs)} checkpoint(s).")
 
     # -----------------------------------------------------------------------
     # Process each checkpoint
@@ -189,6 +202,7 @@ def main():
                 double_critic=double_critic,
                 memoryless=memoryless,
                 action_concat=action_concat,
+                algo=algo,
                 env_seed=int(run_args["seed"]),
             )
 

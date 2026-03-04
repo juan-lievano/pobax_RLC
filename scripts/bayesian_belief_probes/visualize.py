@@ -43,13 +43,21 @@ def _make_experiment_label(config: dict) -> str:
         return ""
     env  = config.get("env_name", "?")
     h    = config.get("hidden_size", "?")
-    dc   = "dc" if config.get("double_critic") else "no-dc"
-    ml   = "memoryless" if config.get("memoryless") else "recurrent"
-    ac   = "ac" if config.get("action_concat") else "no-ac"
-    ent  = config.get("entropy_coeff", "?")
     ts   = config.get("total_steps", 0)
     ts_s = f"{ts / 1e6:.1f}M" if isinstance(ts, (int, float)) and ts > 0 else "?"
-    return f"{env}  h={h}  {dc}  {ml}  {ac}  ent={ent}  steps={ts_s}"
+    if config.get("algo") == "dqn":
+        mode = "DQN" if config.get("memoryless") else "DRQN"
+        lr   = config.get("lr", "?")
+        tr   = config.get("trace_length", "?")
+        ne   = config.get("num_envs", "?")
+        bbs  = config.get("buffer_batch_size", "?")
+        return f"{env}  {mode}  h={h}  lr={lr}  tr={tr}  ne={ne}  bbs={bbs}  steps={ts_s}"
+    else:
+        dc   = "dc" if config.get("double_critic") else "no-dc"
+        ml   = "memoryless" if config.get("memoryless") else "recurrent"
+        ac   = "ac" if config.get("action_concat") else "no-ac"
+        ent  = config.get("entropy_coeff", "?")
+        return f"{env}  h={h}  {dc}  {ml}  {ac}  ent={ent}  steps={ts_s}"
 
 
 # ---------------------------------------------------------------------------

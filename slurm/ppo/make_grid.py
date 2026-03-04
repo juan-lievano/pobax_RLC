@@ -28,7 +28,7 @@ TOTAL_STEPS_OPTIONS = [
     127_959_040,   # DIVISOR * 781  (~128M)
 ]
 
-OUT_PATH = "slurm/grid.tsv"
+OUT_PATH = "slurm/ppo/grid.tsv"
 
 
 def is_valid(total_steps: int) -> bool:

@@ -33,7 +33,7 @@ set -u
 cd /nas/ucb/juanlievano/pobax_RLC
 
 MEM_TAG="$([ "$MEMORYLESS" = "True" ] && echo "dqn" || echo "drqn")"
-STUDY_NAME="dqn_cluster_run_1"
+STUDY_NAME="dqn_${ENV_NAME}_lr${LR}_tr${TRACE_LENGTH}_h${HIDDEN_SIZE}_ne${NUM_ENVS}_bbs${BUFFER_BATCH_SIZE}_${MEM_TAG}"
 
 echo "=== Run config ==="
 echo "Job ID:               ${SLURM_JOB_ID:-N/A}"
@@ -80,6 +80,8 @@ CMD=(srun python -m pobax.algos.dqn
   --platform "$PLATFORM"
   --num_eval_envs "$NUM_EVAL_ENVS"
   --study_name "$STUDY_NAME"
+  --save_checkpoints
+  --num_checkpoints 20
 )
 
 if [ "$MEMORYLESS" = "True" ]; then

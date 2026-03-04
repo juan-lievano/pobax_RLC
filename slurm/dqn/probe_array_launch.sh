@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=dqn_smoke
+# Submit with dependency on training array:
+#
+#   TRAIN_JOB=$(sbatch --array=0-359 --parsable slurm/dqn/array_launch.sh)
+#   sbatch --array=0-359 --dependency=aftercorr:$TRAIN_JOB slurm/dqn/probe_array_launch.sh
+#
+#SBATCH --job-name=dqn_probes
 #SBATCH --output=/nas/ucb/juanlievano/pobax_RLC/slurm/logs/%x_%A_%a.log
 #SBATCH --error=/nas/ucb/juanlievano/pobax_RLC/slurm/logs/%x_%A_%a.err
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=256GB
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32GB
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=4:00:00
 
 set -euo pipefail
 
-GRID_FILE="/nas/ucb/juanlievano/pobax_RLC/slurm/dqn_smoke_tests/grid_dqn.tsv"
+GRID_FILE="/nas/ucb/juanlievano/pobax_RLC/slurm/dqn/grid.tsv"
 
 if [[ ! -f "$GRID_FILE" ]]; then
   echo "ERROR: grid file not found at $GRID_FILE"
-  echo "Did you run: python slurm/dqn_smoke_tests/make_grid_dqn.py  (from repo root)?"
+  echo "Did you run: python slurm/dqn/make_grid.py  (from repo root)?"
   exit 1
 fi
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}"
 
-# grid_dqn.tsv has 1 header line starting with '#'
+# grid.tsv has 1 header line starting with '#'
 LINE_NUM=$(( TASK_ID + 2 ))  # +1 for 1-indexed sed, +1 to skip header
 LINE="$(sed -n "${LINE_NUM}p" "$GRID_FILE" || true)"
 
@@ -41,4 +46,4 @@ echo "  NUM_ENVS=$NUM_ENVS"
 echo "  BUFFER_BATCH_SIZE=$BUFFER_BATCH_SIZE"
 echo "  MEMORYLESS=$MEMORYLESS"
 
-bash /nas/ucb/juanlievano/pobax_RLC/slurm/dqn_smoke_tests/run_one_dqn.sh
+bash /nas/ucb/juanlievano/pobax_RLC/slurm/dqn/probe_run_one.sh

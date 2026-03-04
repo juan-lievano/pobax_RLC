@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate slurm/dqn_smoke_tests/grid_dqn.tsv — one row per DRQN/DQN experiment.
+"""Generate slurm/dqn/grid.tsv — one row per DRQN/DQN experiment.
 
 360 total:
   240 DRQN (memoryless=False): 5 envs × 3 lrs × 2 trace_lengths × 2 hidden_sizes
@@ -10,18 +10,10 @@
 
 Fixed: epsilon_finish=0.05, total_steps=256M, study_name=dqn_cluster_run_1
 
-Changes from previous sweep (96 runs, 256M steps):
-  - envs:             add rocksample_7_8, marquee_40_16
-  - memoryless:       sweep DQN (True) vs DRQN (False)
-  - buffer_batch_size: new sweep dimension [64, 128]
-  - num_envs:         new sweep dimension [32, 64]
-  - epsilon_finish:   fixed at 0.05 (low sensitivity from previous sweeps)
-  - study_name:       dqn_cluster_run_1 (all runs share one results directory)
-
 Usage (from repo root):
-    python slurm/dqn_smoke_tests/make_grid_dqn.py
+    python slurm/dqn/make_grid.py
 Then submit:
-    sbatch --array=0-359%32 slurm/dqn_smoke_tests/array_launch_dqn.sh
+    sbatch --array=0-359%32 slurm/dqn/array_launch.sh
     # Increase %32 to %64 or %96 if more GPUs are available.
 """
 from itertools import product
@@ -40,7 +32,7 @@ HIDDEN_SIZES       = ["64", "128"]
 NUM_ENVS_LIST      = ["32", "64"]
 BUFFER_BATCH_SIZES = ["64", "128"]
 
-OUT_PATH = "slurm/dqn_smoke_tests/grid_dqn.tsv"
+OUT_PATH = "slurm/dqn/grid.tsv"
 
 
 def main() -> None:
@@ -72,7 +64,7 @@ def main() -> None:
             f.write("\t".join(r) + "\n")
 
     print(f"Wrote {len(rows)} rows to {OUT_PATH}  ({len(drqn_rows)} DRQN + {len(dqn_rows)} DQN)")
-    print(f"Submit: sbatch --array=0-359%32 slurm/dqn_smoke_tests/array_launch_dqn.sh")
+    print(f"Submit: sbatch --array=0-359%32 slurm/dqn/array_launch.sh")
 
 
 if __name__ == "__main__":
