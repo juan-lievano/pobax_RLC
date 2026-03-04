@@ -1,0 +1,7 @@
+{
+  "_comment": "Min mean episodic return required to probe a run. Omit an env to probe all runs.",
+  "rocksample_5_5": 4.0,
+  "rocksample_7_8": 6.0,
+  "compass_world_8": 0.6,
+  "marquee_40_16": 10.0
+}

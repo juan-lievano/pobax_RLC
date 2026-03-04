@@ -14,17 +14,23 @@ Usage:
         [--out_dir    probe_results/my_exp] \\
         [--h_idx 0] \\
         [--force]
+        [--no_viz]
+        [--probing_config example.json]
 
 --run_dir can point either directly to the timestamped run directory
 (e.g. results/.../rocksample_11_11_seed(2026)_time(...)) or to its
 parent directory.  If the parent contains exactly one subdirectory it
 is resolved automatically, so you never have to copy the hash string.
+
+Batch-dir mode: if --run_dir contains multiple non-checkpoint subdirs,
+each is treated as a separate run and processed in sequence.
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import orbax.checkpoint
 
 # Make sibling modules importable
@@ -32,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sample_trajectories import sample_and_save
 from train_probes import train_and_save
 from visualize import visualize_results
+
+PROBING_CONFIGS_DIR = Path(__file__).parent / "probing_configs"
 
 
 def _resolve_run_dir(path: Path) -> Path:
@@ -56,6 +64,43 @@ def _resolve_run_dir(path: Path) -> Path:
     )
 
 
+def _is_batch_dir(path: Path) -> bool:
+    """Return True if path contains multiple non-checkpoint subdirs (batch mode)."""
+    subdirs = [d for d in path.iterdir()
+               if d.is_dir() and not d.name.startswith("checkpoint_")]
+    return len(subdirs) > 1
+
+
+def _load_probing_config(config_name: str) -> dict:
+    config_path = PROBING_CONFIGS_DIR / config_name
+    if not config_path.exists():
+        raise FileNotFoundError(f"Probing config not found: {config_path}")
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def _check_reward_threshold(run_dir: Path, env_name: str, threshold: float) -> tuple[bool, float]:
+    """Load main checkpoint and check if mean return meets threshold.
+    Returns (passes, mean_return).
+    """
+    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    try:
+        result = checkpointer.restore(run_dir)
+    except Exception as e:
+        print(f"  [WARN] could not load checkpoint for threshold check: {e}")
+        return True, float("nan")
+
+    fe = result.get("final_eval", result.get("final_eval_metric", {}))
+    rets = np.asarray(fe.get("returned_episode_returns", []))
+    mask = np.asarray(fe.get("returned_episode", []), dtype=bool)
+    completed = rets[mask]
+    if completed.size == 0:
+        print(f"  [WARN] no completed episodes found for threshold check, skipping filter")
+        return True, float("nan")
+    mean_ret = float(completed.mean())
+    return mean_ret >= threshold, mean_ret
+
+
 def _discover_checkpoints(run_dir: Path):
     """Return checkpoint subdirs sorted numerically by index."""
     dirs = [
@@ -65,43 +110,9 @@ def _discover_checkpoints(run_dir: Path):
     return sorted(dirs, key=lambda d: int(d.name.split("_")[1]))
 
 
-def main():
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument("--run_dir",  required=True, type=Path,
-                   help="Top-level Orbax run directory (contains checkpoint_* subdirs).")
-    p.add_argument("--n_traj",      type=int, default=1000,
-                   help="Trajectories to sample per checkpoint per seed (default 1000).")
-    p.add_argument("--n_timesteps", type=int, default=10000,
-                   help="Training budget: probe training is capped at this many timesteps "
-                        "per seed per checkpoint, making all probes see the same amount of data "
-                        "regardless of env or checkpoint (default 10000).")
-    p.add_argument("--max_len",  type=int, default=1000,
-                   help="Maximum steps per trajectory (default 1000).")
-    p.add_argument("--out_dir",  type=Path, default=None,
-                   help="Root directory for probe pipeline outputs. "
-                        "Defaults to probe_results/<parent-dir-of-run_dir>.")
-    p.add_argument("--h_idx",   type=int, default=0,
-                   help="Hparam index to use (default 0).")
-    p.add_argument("--seed",    type=int, default=0,
-                   help="Base RNG seed for trajectory sampling.")
-    p.add_argument("--force",   action="store_true",
-                   help="Overwrite existing NPZ/JSON files.")
-    # Probe training hyper-params (forwarded to train_and_save)
-    p.add_argument("--epochs",     type=int,   default=80)
-    p.add_argument("--batch_size", type=int,   default=1024)
-    p.add_argument("--mlp_lr",     type=float, default=1e-3)
-    p.add_argument("--mlp_wd",     type=float, default=1e-4)
-    p.add_argument("--linear_lr",  type=float, default=1e-2)
-    p.add_argument("--linear_wd",  type=float, default=1.0)
-    args = p.parse_args()
-
-    raw_dir = args.run_dir.resolve()
-    # out_dir is derived from the path the user typed (before auto-resolution),
-    # so it stays clean even when we descend into a timestamped child.
-    out_dir = (args.out_dir or Path("probe_results") / raw_dir.name).resolve()
-    run_dir = _resolve_run_dir(raw_dir)
+def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
+    """Process a single run: sample trajectories, train probes, optionally visualize."""
+    run_dir = _resolve_run_dir(run_dir_raw)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------
@@ -119,6 +130,7 @@ def main():
     double_critic = bool(run_args.get("double_critic", False))
     memoryless    = bool(run_args.get("memoryless", False))
     action_concat = bool(run_args.get("action_concat", False))
+
     def _scalar(v, t, default):
         """Coerce an orbax-restored value (may be list/array/scalar) to a Python scalar."""
         if isinstance(v, (list, tuple)):
@@ -142,6 +154,19 @@ def main():
         f"memoryless={memoryless}, action_concat={action_concat}, "
         f"entropy_coeff={entropy_coeff}, total_steps={total_steps}"
     )
+
+    # -----------------------------------------------------------------------
+    # Optional reward threshold check (probing_config)
+    # -----------------------------------------------------------------------
+    if args.probing_config:
+        probing_cfg = _load_probing_config(args.probing_config)
+        threshold = probing_cfg.get(env_name)
+        if threshold is not None:
+            passes, mean_ret = _check_reward_threshold(run_dir, env_name, threshold)
+            if not passes:
+                print(f"  SKIP: mean_return={mean_ret:.3f} < threshold={threshold} for {env_name}")
+                return
+            print(f"  PASS: mean_return={mean_ret:.3f} >= threshold={threshold} for {env_name}")
 
     # Save a run_config.json so visualize.py can label figures when run standalone
     config = {
@@ -230,12 +255,83 @@ def main():
             )
 
     # -----------------------------------------------------------------------
-    # Step 3: visualize
+    # Step 3: visualize (skipped with --no_viz)
     # -----------------------------------------------------------------------
-    print("\nGenerating visualizations...")
-    figures_dir = out_dir / "figures"
-    visualize_results(out_dir, figures_dir, h_idx=args.h_idx, config=config)
+    if not args.no_viz:
+        print("\nGenerating visualizations...")
+        figures_dir = out_dir / "figures"
+        visualize_results(out_dir, figures_dir, h_idx=args.h_idx, config=config)
     print(f"\nDone. Results in {out_dir}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--run_dir",  required=True, type=Path,
+                   help="Top-level Orbax run directory (contains checkpoint_* subdirs), "
+                        "its parent, or a batch directory with multiple run subdirs.")
+    p.add_argument("--n_traj",      type=int, default=1000,
+                   help="Trajectories to sample per checkpoint per seed (default 1000).")
+    p.add_argument("--n_timesteps", type=int, default=10000,
+                   help="Training budget: probe training is capped at this many timesteps "
+                        "per seed per checkpoint, making all probes see the same amount of data "
+                        "regardless of env or checkpoint (default 10000).")
+    p.add_argument("--max_len",  type=int, default=1000,
+                   help="Maximum steps per trajectory (default 1000).")
+    p.add_argument("--out_dir",  type=Path, default=None,
+                   help="Root directory for probe pipeline outputs. "
+                        "Defaults to probe_results/<parent-dir-of-run_dir>.")
+    p.add_argument("--h_idx",   type=int, default=0,
+                   help="Hparam index to use (default 0).")
+    p.add_argument("--seed",    type=int, default=0,
+                   help="Base RNG seed for trajectory sampling.")
+    p.add_argument("--force",   action="store_true",
+                   help="Overwrite existing NPZ/JSON files.")
+    p.add_argument("--no_viz",  action="store_true",
+                   help="Skip visualization step (useful on server; visualize locally).")
+    p.add_argument("--probing_config", type=str, default=None,
+                   help="Filename (not full path) of a JSON in "
+                        "scripts/bayesian_belief_probes/probing_configs/ specifying "
+                        "minimum mean episodic return required to probe each env.")
+    # Probe training hyper-params (forwarded to train_and_save)
+    p.add_argument("--epochs",     type=int,   default=80)
+    p.add_argument("--batch_size", type=int,   default=1024)
+    p.add_argument("--mlp_lr",     type=float, default=1e-3)
+    p.add_argument("--mlp_wd",     type=float, default=1e-4)
+    p.add_argument("--linear_lr",  type=float, default=1e-2)
+    p.add_argument("--linear_wd",  type=float, default=1.0)
+    args = p.parse_args()
+
+    raw_dir = args.run_dir.resolve()
+
+    # -----------------------------------------------------------------------
+    # Batch-dir mode: multiple run subdirs in the top-level dir
+    # -----------------------------------------------------------------------
+    if _is_batch_dir(raw_dir):
+        subdirs = sorted(
+            d for d in raw_dir.iterdir()
+            if d.is_dir() and not d.name.startswith("checkpoint_")
+        )
+        print(f"Batch mode: found {len(subdirs)} run(s) in {raw_dir}")
+        for run_subdir in subdirs:
+            print(f"\n{'='*60}")
+            print(f"Processing run: {run_subdir.name}")
+            print(f"{'='*60}")
+            run_out_dir = (args.out_dir or Path("probe_results") / raw_dir.name) / run_subdir.name
+            try:
+                _process_one_run(run_subdir, run_out_dir, args)
+            except Exception as e:
+                print(f"  ERROR processing {run_subdir.name}: {e}", file=sys.stderr)
+        return
+
+    # -----------------------------------------------------------------------
+    # Single-run mode
+    # -----------------------------------------------------------------------
+    # out_dir is derived from the path the user typed (before auto-resolution),
+    # so it stays clean even when we descend into a timestamped child.
+    out_dir = (args.out_dir or Path("probe_results") / raw_dir.name).resolve()
+    _process_one_run(raw_dir, out_dir, args)
 
 
 if __name__ == "__main__":

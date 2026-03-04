@@ -1,6 +1,8 @@
 """Compare probe results from multiple experiments on the same plots.
 
-Each experiment is a probe_results directory produced by run_probe_pipeline.py.
+Each experiment is a probe_results directory produced by run_probe_pipeline.py,
+or all experiments can be loaded from an exported JSON (produced by export_results.py).
+
 Results are grouped by environment; one figure per env.  Each figure shows
 the MLP probe belief metrics + episodic reward over training progress.
 
@@ -13,8 +15,15 @@ Usage:
     # auto-label from run_config.json (omit --labels):
     python scripts/bayesian_belief_probes/compare_results.py \\
         --dirs probe_results/ppo_run1 probe_results/dqn_run2
+
+    # load from exported JSON (after downloading from server):
+    python scripts/bayesian_belief_probes/compare_results.py \\
+        --from_json export.json \\
+        --labels "PPO rec" "DRQN" \\
+        --out_dir figures/
 """
 import argparse
+import gzip
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -105,7 +114,13 @@ def _metric_curve(exp: dict, grouped: dict, metric: str, ckpt_indices: list,
 
 def _reward_curve(exp: dict, color: str, ls: str, ax, show_label: bool):
     """Add mean episodic return curve to ax."""
-    rewards_by_ckpt = _load_rewards_by_ckpt(exp["dir"], h_idx=0)
+    # Use preloaded rewards (from --from_json mode) or load from disk
+    if exp.get("rewards_by_ckpt") is not None:
+        rewards_by_ckpt = exp["rewards_by_ckpt"]
+    elif exp.get("dir") is not None:
+        rewards_by_ckpt = _load_rewards_by_ckpt(exp["dir"], h_idx=0)
+    else:
+        rewards_by_ckpt = {}
     if not rewards_by_ckpt:
         return
     xs_raw = sorted(rewards_by_ckpt)
@@ -190,27 +205,99 @@ def plot_comparison_for_env(env_name: str, experiments: list, out_dir: Path):
     print(f"  saved {out_path}")
 
 
+# ── JSON loading (from export_results.py output) ─────────────────────────────
+
+def _load_json_file(path: Path) -> dict:
+    """Load a plain or gzip-compressed JSON file."""
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_experiments_from_json(json_path: Path, labels: list | None) -> list:
+    """Build experiments list from an export_results.py output file.
+
+    The export JSON schema (from export_results.py):
+      { "runs": [ { "run_id", "config", "checkpoints": {
+          "<ckpt_idx>": { "seeds": {
+              "<seed_idx>": { "metrics": {...}, "ep_returns": [...] }
+          }}
+      }} ] }
+    """
+    data = _load_json_file(json_path)
+    runs = data.get("runs", data) if isinstance(data, dict) else data
+
+    experiments = []
+    for i, run in enumerate(runs):
+        config = run.get("config", {})
+        records = []
+        rewards_by_ckpt: dict = {}
+
+        for ckpt_str, ckpt_data in run.get("checkpoints", {}).items():
+            ckpt_idx = int(ckpt_str)
+            seeds_data = ckpt_data.get("seeds", {})
+            seed_means = []
+
+            for seed_str, seed_data in sorted(seeds_data.items(), key=lambda x: int(x[0])):
+                seed_idx = int(seed_str)
+                records.append({
+                    "hparam_idx":    0,
+                    "checkpoint_idx": ckpt_idx,
+                    "seed_idx":      seed_idx,
+                    "metrics":       seed_data.get("metrics", {}),
+                })
+                ep_returns = seed_data.get("ep_returns", [])
+                if ep_returns:
+                    seed_means.append(float(np.mean(ep_returns)))
+
+            if seed_means:
+                rewards_by_ckpt[ckpt_idx] = np.array(seed_means)
+
+        env_name = config.get("env_name") or (
+            records[0].get("env_name", "?") if records else "?"
+        )
+        label = (labels[i] if labels and i < len(labels) else None) or _auto_label(config)
+        experiments.append({
+            "label":           label,
+            "config":          config,
+            "records":         records,
+            "env_name":        str(env_name),
+            "dir":             None,
+            "rewards_by_ckpt": rewards_by_ckpt,
+        })
+
+    return experiments
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dirs",   nargs="+", required=True, type=Path,
-                   help="Probe results directories to compare.")
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--dirs", nargs="+", type=Path,
+                        help="Probe results directories to compare.")
+    source.add_argument("--from_json", type=Path, metavar="FILE",
+                        help="Load all experiments from an exported JSON (or .json.gz) "
+                             "produced by export_results.py.")
     p.add_argument("--labels", nargs="+", default=None,
-                   help="Labels for each directory (auto-generated from run_config.json if omitted).")
+                   help="Labels for each experiment (auto-generated if omitted).")
     p.add_argument("--out_dir", type=Path, default=Path("compare_figures"),
                    help="Output directory for comparison figures (default: compare_figures/).")
     p.add_argument("--envs", nargs="*", default=None,
                    help="Only compare these environments (default: all found).")
     args = p.parse_args()
 
-    if args.labels and len(args.labels) != len(args.dirs):
-        p.error("--labels must have the same number of entries as --dirs")
-
-    labels = args.labels or [None] * len(args.dirs)
-    experiments = [load_experiment(Path(d), lbl)
-                   for d, lbl in zip(args.dirs, labels)]
+    if args.from_json:
+        experiments = load_experiments_from_json(args.from_json, args.labels)
+    else:
+        if args.labels and len(args.labels) != len(args.dirs):
+            p.error("--labels must have the same number of entries as --dirs")
+        labels = args.labels or [None] * len(args.dirs)
+        experiments = [load_experiment(Path(d), lbl)
+                       for d, lbl in zip(args.dirs, labels)]
 
     # Group by env
     by_env: dict = defaultdict(list)
@@ -221,7 +308,7 @@ def main():
         by_env = {k: v for k, v in by_env.items() if k in args.envs}
 
     if not by_env:
-        print("No matching environments found. Check --dirs and --envs.")
+        print("No matching environments found. Check --dirs / --from_json and --envs.")
         return
 
     print(f"Comparing {len(experiments)} experiment(s) across {len(by_env)} env(s):")
