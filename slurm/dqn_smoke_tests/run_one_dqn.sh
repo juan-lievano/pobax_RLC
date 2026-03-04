@@ -2,22 +2,21 @@
 set -euo pipefail
 
 # Expected env vars (set by array_launch_dqn.sh):
-#   ENV_NAME, LR, EPSILON_FINISH, TRACE_LENGTH, HIDDEN_SIZE
+#   ENV_NAME, LR, TRACE_LENGTH, HIDDEN_SIZE, NUM_ENVS, BUFFER_BATCH_SIZE, MEMORYLESS
 
 # ---- Fixed constants ----
-NUM_ENVS=32
 N_SEEDS=1
 SEED=2026
-TOTAL_STEPS=64000000       # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS = 2000000
+TOTAL_STEPS=256000000      # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS
 BUFFER_SIZE=1000000
+EPSILON_FINISH=0.05        # fixed (sweep showed low sensitivity)
 
 # All schedule params below are in SCAN STEPS (vectorised env steps, +1 per _env_step).
 # 1 scan step = NUM_ENVS individual transitions.
-# To convert from old transition-based values: divide by NUM_ENVS.
-TRAINING_INTERVAL=10       # gradient update every 10 scan steps  (= 320 transitions)
-TARGET_UPDATE_INTERVAL=62  # target copy every 62 scan steps       (= 2000 transitions, same as before)
-LEARNING_STARTS=156        # start learning after 156 scan steps   (= 5000 transitions, same as before)
-EPSILON_ANNEAL_TIME=$(( TOTAL_STEPS / 2 / NUM_ENVS ))  # anneal over first half of scan steps (~15625)
+TRAINING_INTERVAL=10       # gradient update every 10 scan steps
+TARGET_UPDATE_INTERVAL=62  # target copy every 62 scan steps
+LEARNING_STARTS=156        # start learning after 156 scan steps
+EPSILON_ANNEAL_TIME=$(( TOTAL_STEPS / 2 / NUM_ENVS ))  # anneal over first half of scan steps
 NUM_EVAL_ENVS=64
 PLATFORM=gpu
 
@@ -33,6 +32,9 @@ set -u
 
 cd /nas/ucb/juanlievano/pobax_RLC
 
+MEM_TAG="$([ "$MEMORYLESS" = "True" ] && echo "dqn" || echo "drqn")"
+STUDY_NAME="dqn_cluster_run_1"
+
 echo "=== Run config ==="
 echo "Job ID:               ${SLURM_JOB_ID:-N/A}"
 echo "Host:                 $(hostname)"
@@ -43,9 +45,12 @@ echo "EPSILON_FINISH:       $EPSILON_FINISH"
 echo "TRACE_LENGTH:         $TRACE_LENGTH"
 echo "HIDDEN_SIZE:          $HIDDEN_SIZE"
 echo "NUM_ENVS:             $NUM_ENVS"
+echo "BUFFER_BATCH_SIZE:    $BUFFER_BATCH_SIZE"
+echo "MEMORYLESS:           $MEMORYLESS  (mode: $MEM_TAG)"
 echo "TOTAL_STEPS:          $TOTAL_STEPS"
 echo "BUFFER_SIZE:          $BUFFER_SIZE"
 echo "EPSILON_ANNEAL_TIME:  $EPSILON_ANNEAL_TIME"
+echo "STUDY_NAME:           $STUDY_NAME"
 echo "=================="
 
 echo "JAX devices:"
@@ -54,12 +59,7 @@ python -c "import jax; print(jax.devices()); print('Backend:', jax.default_backe
 echo "--- GPU info ---"
 nvidia-smi --query-gpu=name,memory.total,memory.free,utilization.gpu --format=csv,noheader || true
 
-# ---- Study name ----
-LR_TAG="$(printf "%s" "$LR" | sed 's/\./p/g; s/e-0*/e/g')"
-EPS_TAG="$(printf "%s" "$EPSILON_FINISH" | sed 's/\./p/g')"
-STUDY_NAME="${ENV_NAME}_drqn_lr${LR_TAG}_eps${EPS_TAG}_tr${TRACE_LENGTH}_h${HIDDEN_SIZE}_s${N_SEEDS}"
-
-echo "Running DRQN: study_name=$STUDY_NAME"
+echo "Running $MEM_TAG: study_name=$STUDY_NAME"
 
 CMD=(srun python -m pobax.algos.dqn
   --env "$ENV_NAME"
@@ -68,6 +68,7 @@ CMD=(srun python -m pobax.algos.dqn
   --num_envs "$NUM_ENVS"
   --trace_length "$TRACE_LENGTH"
   --buffer_size "$BUFFER_SIZE"
+  --buffer_batch_size "$BUFFER_BATCH_SIZE"
   --training_interval "$TRAINING_INTERVAL"
   --target_update_interval "$TARGET_UPDATE_INTERVAL"
   --learning_starts "$LEARNING_STARTS"
@@ -80,6 +81,10 @@ CMD=(srun python -m pobax.algos.dqn
   --num_eval_envs "$NUM_EVAL_ENVS"
   --study_name "$STUDY_NAME"
 )
+
+if [ "$MEMORYLESS" = "True" ]; then
+  CMD+=(--memoryless)
+fi
 
 # shellcheck disable=SC2068
 ${CMD[@]}
