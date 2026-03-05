@@ -19,6 +19,24 @@ import orbax.checkpoint
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _is_orbax_checkpoint(path: Path) -> bool:
+    """Fast check: does this directory look like an Orbax checkpoint?"""
+    return (path / "_METADATA").exists()
+
+
+def _read_strings_json(path: Path) -> dict:
+    """Read the lightweight _strings.json metadata (env name, etc.)."""
+    p = path / "_strings.json"
+    if not p.exists():
+        return {}
+    try:
+        import json
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _restore(path: Path, verbose: bool) -> dict | None:
     try:
         return orbax.checkpoint.PyTreeCheckpointer().restore(path)
@@ -82,7 +100,20 @@ def main() -> None:
         sys.exit(f"ERROR: directory not found: {results_root}")
 
     rows = []
+    n_skipped = 0
     for candidate in _candidate_dirs(results_root):
+        # Fast pre-filter: skip dirs that aren't Orbax checkpoints
+        if not _is_orbax_checkpoint(candidate):
+            continue
+
+        # Pre-filter by pattern using lightweight _strings.json (avoids full restore)
+        if args.pattern:
+            strings = _read_strings_json(candidate)
+            env_hint = strings.get("args.env", "")
+            if env_hint and args.pattern not in env_hint:
+                n_skipped += 1
+                continue
+
         result = _restore(candidate, args.verbose)
         if result is None:
             continue
