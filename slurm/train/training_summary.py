@@ -139,7 +139,7 @@ def main() -> None:
             "mean_ret": mean_ret, "std_ret": std_ret, "n_ep": n_ep, "runtime": rt,
         }
 
-        if algo == "ppo":
+        if algo in ("ppo", "transformer_xl"):
             row["dc"]  = bool(_scalar(cfg.get("double_critic"), False))
             row["ac"]  = bool(_scalar(cfg.get("action_concat"), False))
             row["ent"] = f"{float(_scalar(cfg.get('entropy_coeff'), 0)):.3f}"
@@ -176,11 +176,16 @@ def main() -> None:
             print()
         prev_env = r["env"]
 
-        mode_s  = ("DQN" if r["ml"] else "DRQN") if r["algo"] == "dqn" else ("PPO-ML" if r["ml"] else "PPO")
+        if r["algo"] == "dqn":
+            mode_s = "DQN" if r["ml"] else "DRQN"
+        elif r["algo"] == "transformer_xl":
+            mode_s = "TXL"
+        else:
+            mode_s = "PPO-ML" if r["ml"] else "PPO"
         mean_s  = f"{r['mean_ret']:>10.2f}" if not np.isnan(r["mean_ret"]) else f"{'no eps':>10}"
         std_s   = f"{r['std_ret']:>8.2f}"   if not np.isnan(r["std_ret"])  else f"{'':>8}"
 
-        if r["algo"] == "ppo":
+        if r["algo"] in ("ppo", "transformer_xl"):
             ts_s = f"{r['ts'] / 1e6:.0f}M" if r["ts"] > 0 else "?"
             dc_s = "Y" if r["dc"] else "N"
             ac_s = "Y" if r["ac"] else "N"
@@ -196,8 +201,9 @@ def main() -> None:
     print(sep)
     print(f"\nTotal runs: {len(rows)}")
     n_ppo = sum(1 for r in rows if r["algo"] == "ppo")
-    n_dqn = sum(1 for r in rows if r["algo"] != "ppo")
-    print(f"  PPO: {n_ppo}  DQN/DRQN: {n_dqn}")
+    n_txl = sum(1 for r in rows if r["algo"] == "transformer_xl")
+    n_dqn = sum(1 for r in rows if r["algo"] == "dqn")
+    print(f"  PPO: {n_ppo}  Transformer: {n_txl}  DQN/DRQN: {n_dqn}")
     print("MEM=memoryless flag  HS=hidden_size  MEAN_RET: greedy policy. 'no eps' = all timed out.")
 
 
