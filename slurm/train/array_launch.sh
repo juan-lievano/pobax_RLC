@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-GRID_FILE="/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid.tsv"
+GRID_FILE="${GRID_FILE:-/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid.tsv}"
 
 if [[ ! -f "$GRID_FILE" ]]; then
   echo "ERROR: grid file not found at $GRID_FILE"
@@ -60,8 +60,11 @@ case "$ALGO" in
   dqn)
     bash /nas/ucb/juanlievano/pobax_RLC/slurm/train/run_dqn.sh
     ;;
+  transformer_xl)
+    bash /nas/ucb/juanlievano/pobax_RLC/slurm/train/run_transformer_xl.sh
+    ;;
   *)
-    echo "ERROR: unknown ALGO='$ALGO' (expected ppo or dqn)"
+    echo "ERROR: unknown ALGO='$ALGO' (expected ppo, dqn, or transformer_xl)"
     exit 3
     ;;
 esac

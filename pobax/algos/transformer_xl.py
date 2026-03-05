@@ -408,9 +408,27 @@ def make_train(args: TransformerHyperparams, rand_key: jax.random.PRNGKey):
         done = jnp.zeros((args.num_envs,), dtype=jnp.bool_)
 
         runner_state = (train_state, env_state, memories, memories_mask, memories_mask_idx, obsv, done, 0, _rng)
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, jnp.arange(num_updates), num_updates
-        )
+
+        if args.save_checkpoints:
+            assert num_updates % args.num_checkpoints == 0, (
+                f"num_updates ({num_updates}) must be divisible by num_checkpoints ({args.num_checkpoints})"
+            )
+            ckpt_interval = num_updates // args.num_checkpoints
+
+            def _checkpoint_update_step(runner_state, _):
+                runner_state, metrics = jax.lax.scan(
+                    _update_step, runner_state, None, ckpt_interval
+                )
+                return runner_state, (metrics, runner_state[0])
+
+            runner_state, (metric_chunks, ckpt_train_states) = jax.lax.scan(
+                _checkpoint_update_step, runner_state, None, args.num_checkpoints
+            )
+            metric = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), metric_chunks)
+        else:
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, jnp.arange(num_updates), num_updates
+            )
         # save metrics only every update_log_freq
         metric = jax.tree.map(update_filter, metric)
 
@@ -426,6 +444,8 @@ def make_train(args: TransformerHyperparams, rand_key: jax.random.PRNGKey):
         )
 
         res = {"runner_state": runner_state, "metric": metric, 'final_eval_metric': eval_traj_batch.info}
+        if args.save_checkpoints:
+            res['ckpt_train_states'] = ckpt_train_states
         return res
 
     return train

@@ -134,19 +134,20 @@ class Transformer(nn.Module):
         encoded = self.encoder(obs)
         pos_embed=self.pos_emb(jnp.arange(1+memories.shape[-3],-1,-1))[:1+memories.shape[-3]]
 
+        out_memory=jnp.zeros((encoded.shape[0],self.num_layers,)+encoded.shape[1:])
         x=encoded
 
         i=0
         for layer in self.tf_layers:
-            #out_memory=out_memory.at[:,layer].set(x)
+            out_memory=out_memory.at[:,i].set(x)
             memory=jnp.concatenate([memories[:,:,i],x[:,None],],axis=-2)
             #memory=jnp.concatenate([memories[:,:,i],x[:,None],],axis=1)
             x = layer(values_keys=memory,queries=x[:,None],pos_embed=pos_embed, mask=mask)
-            x=x.squeeze()
-            
+            x=x.squeeze(axis=-2)
+
             i=i+1
-            
-        return x
+
+        return x, out_memory
 
     def forward_eval(self, memories,obs: jnp.ndarray, mask: jnp.ndarray):
         #forward eval so obs is only one timestep
@@ -166,7 +167,7 @@ class Transformer(nn.Module):
             memory=jnp.concatenate([memories[:,:,i],x[:,None]],axis=-2)
             #memory=jnp.concatenate([memories[:,:,i],x[:,None]],axis=1)
             x = layer(values_keys=memory,pos_embed=pos_embed,queries=x[:,None], mask=mask)
-            x=x.squeeze()
+            x=x.squeeze(axis=-2)
             i=i+1
             
         return x, out_memory

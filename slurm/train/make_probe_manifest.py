@@ -32,32 +32,24 @@ def _resolve_run_dir(path: Path) -> Path | None:
     return None
 
 
-def _mean_return(run_dir: Path) -> float | None:
-    """Load main Orbax checkpoint and return mean episodic return, or None on failure."""
+def _load_run_info(run_dir: Path) -> tuple[str | None, float | None]:
+    """Load checkpoint once, return (env_name, mean_return)."""
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     try:
         result = checkpointer.restore(run_dir)
     except Exception as e:
         print(f"  [WARN] could not load {run_dir}: {e}", file=sys.stderr)
-        return None
+        return None, None
+
+    env = str(result.get("args", {}).get("env", "")) or None
 
     fe = result.get("final_eval", result.get("final_eval_metric", {}))
     rets = np.asarray(fe.get("returned_episode_returns", []))
     mask = np.asarray(fe.get("returned_episode", []), dtype=bool)
     completed = rets[mask]
-    if completed.size == 0:
-        return None
-    return float(completed.mean())
+    mean_ret = float(completed.mean()) if completed.size > 0 else None
 
-
-def _env_name(run_dir: Path) -> str | None:
-    """Read env name from the Orbax checkpoint args."""
-    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    try:
-        result = checkpointer.restore(run_dir)
-        return str(result.get("args", {}).get("env", ""))
-    except Exception:
-        return None
+    return env, mean_ret
 
 
 def main() -> None:
@@ -107,12 +99,11 @@ def main() -> None:
             skipped.append((study_dir.name, "no run dir"))
             continue
 
-        # Check reward threshold if config provided
+        # Check reward threshold if config provided (single restore)
         if thresholds:
-            env = _env_name(run_dir)
+            env, mean_ret = _load_run_info(run_dir)
             if env and env in thresholds:
                 threshold = thresholds[env]
-                mean_ret = _mean_return(run_dir)
                 if mean_ret is None:
                     print(f"  [WARN] no eval data for {study_dir.name}, including anyway")
                 elif mean_ret < threshold:

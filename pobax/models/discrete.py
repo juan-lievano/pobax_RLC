@@ -59,26 +59,40 @@ class DiscreteActorCriticTransformer(nn.Module):
         else:
             self.critic = Critic(hidden_size=self.hidden_size)
 
+    def _squeeze_v(self, v):
+        # double_critic vmap inserts axis after Dense(1), so the size-1 dim
+        # is at -2 for double_critic ([B,1,2]) and -1 for single ([B,1]).
+        # model_forward_train has a 3D embedding so the standard -1 squeeze
+        # works for both cases; this helper is for the 2D-embedding paths.
+        return jnp.squeeze(v, axis=-2 if self.double_critic else -1)
+
     def __call__(self, memories,obs,mask):
         embedding, memory_out = self.transformer(memories,obs,mask)
         pi = self.actor(embedding)
         v = self.critic(embedding)
-        return pi, jnp.squeeze(v, axis=-1), memory_out
-    
+        return pi, self._squeeze_v(v), memory_out
+
     def model_forward_eval(self, memories,obs,mask):
         """Used during environment rollout (single timestep of obs). And return the memory"""
         embedding, memory_out = self.transformer.forward_eval(memories,obs,mask)
         pi = self.actor(embedding)
         v = self.critic(embedding)
-        return pi, jnp.squeeze(v, axis=-1), memory_out
-    
-    def model_forward_train(self, memories,obs,mask): 
+        return pi, self._squeeze_v(v), memory_out
+
+    def model_forward_train(self, memories,obs,mask):
         """Used during training: a window of observation is sent. And don't return the memory"""
         embedding = self.transformer.forward_train(memories,obs,mask)
         pi = self.actor(embedding)
         v = self.critic(embedding)
         return pi, jnp.squeeze(v, axis=-1)
-    
+
+    def forward_with_embedding(self, memories, obs, mask):
+        """Like model_forward_eval but also returns the embedding (for probing)."""
+        embedding, memory_out = self.transformer.forward_eval(memories, obs, mask)
+        pi = self.actor(embedding)
+        v = self.critic(embedding)
+        return pi, self._squeeze_v(v), memory_out, embedding
+
 
 class ImageDiscreteActorCriticTransformer(nn.Module):
     action_dim: int

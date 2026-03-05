@@ -24,6 +24,7 @@ class Hyperparams(Tap):
 
 
 class PPOHyperparams(Tap):
+    algo: str = 'ppo'  # used by probe pipeline to identify algorithm
     env: str = 'tmaze_5'
     num_envs: int = 4  # Number of environments to run in parallel.
     default_max_steps_in_episode: int = 1000  # Gets overridden if this is defined by the env.
@@ -132,6 +133,7 @@ class DQNHyperparams(Tap):
 
 
 class TransformerHyperparams(Tap):
+    algo: str = 'transformer_xl'  # used by probe pipeline to identify algorithm
     env: str = 'tmaze_5'
     num_envs: int = 4
     default_max_steps_in_episode: int = 1000
