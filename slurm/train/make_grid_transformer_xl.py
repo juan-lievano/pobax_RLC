@@ -9,7 +9,7 @@ Hyperparameter choices:
   - DOUBLE_CRITIC: both true and false
   - ENTROPY_COEFF: sweep 0.01 and 0.1
 
-TOTAL_STEPS = 50,135,040  (~50M, divisible by 64*128*20 = 163,840)
+TOTAL_STEPS = 31,948,800  (~32M, divisible by 64*128*20 = 163,840)
 
 Usage (from repo root):
     python slurm/train/make_grid_transformer_xl.py
@@ -34,8 +34,8 @@ DOUBLE_CRITICS = ["false", "true"]
 ENTROPY_COEFFS = ["0.01", "0.1"]
 HIDDEN_SIZE = "128"
 
-# ~50M steps, divisible by 64 * 128 * 20 = 163,840
-TOTAL_STEPS = 50_135_040
+# ~32M steps, divisible by 64 * 128 * 20 = 163,840
+TOTAL_STEPS = 31_948_800
 
 # Must match --num_checkpoints in run_transformer_xl.sh
 NUM_CHECKPOINTS = 20
