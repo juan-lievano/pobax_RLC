@@ -21,7 +21,7 @@ Grid composition (60 rows):
 Usage:
     python slurm/train/make_grid_final.py
 Then submit:
-    GRID_FILE=/path/to/grid_final.tsv sbatch --array=0-59 slurm/train/array_launch.sh
+    GRID_FILE=/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid_final.tsv sbatch --array=0-59 slurm/train/array_launch.sh
 """
 
 ENVS = [
@@ -237,7 +237,7 @@ def main() -> None:
     print(f"  DRQN:                    {len(drqn_rows)}")
     print(f"  DQN (memoryless):        {len(dqn_ml_rows)}")
     print(f"\nSubmit:")
-    print(f"  GRID_FILE=/path/to/grid_final.tsv sbatch --array=0-{len(rows)-1} slurm/train/array_launch.sh")
+    print(f"  GRID_FILE=/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid_final.tsv sbatch --array=0-{len(rows)-1} slurm/train/array_launch.sh")
 
 
 if __name__ == "__main__":

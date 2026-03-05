@@ -9,17 +9,17 @@
 
 set -euo pipefail
 
-GRID_FILE="${GRID_FILE:-/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid.tsv}"
+GRID_FILE="${GRID_FILE:-/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid_final.tsv}"
 
 if [[ ! -f "$GRID_FILE" ]]; then
   echo "ERROR: grid file not found at $GRID_FILE"
-  echo "Did you run: python slurm/train/make_grid.py  (from repo root)?"
+  echo "Did you run: python slurm/train/make_grid_final.py  (from repo root)?"
   exit 1
 fi
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}"
 
-# grid.tsv has 1 header line starting with '#'
+# grid_final.tsv has 1 header line starting with '#'
 LINE_NUM=$(( TASK_ID + 2 ))  # +1 for 1-indexed sed, +1 to skip header
 LINE="$(sed -n "${LINE_NUM}p" "$GRID_FILE" || true)"
 
