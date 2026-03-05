@@ -248,9 +248,9 @@ def load_experiments_from_json(json_path: Path, labels: list | None) -> list:
                     "seed_idx":      seed_idx,
                     "metrics":       seed_data.get("metrics", {}),
                 })
-                ep_returns = seed_data.get("ep_returns", [])
-                if ep_returns:
-                    seed_means.append(float(np.mean(ep_returns)))
+                mean_ret = seed_data.get("mean_ep_return")
+                if mean_ret is not None:
+                    seed_means.append(float(mean_ret))
 
             if seed_means:
                 rewards_by_ckpt[ckpt_idx] = np.array(seed_means)

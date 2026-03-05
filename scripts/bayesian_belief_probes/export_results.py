@@ -32,7 +32,8 @@ Output schema (JSON):
                   "analytic_mean_constant_kl": { ... }
                 },
                 "belief_sanity": { ... },   # omitted if not present
-                "ep_returns": [float, ...], # one per episode; omitted if no NPZ
+                "mean_ep_return": float,    # mean over episodes; omitted if no NPZ
+                "std_ep_return": float,     # std over episodes; omitted if no NPZ
                 "mean_pred_belief": { ... } # omitted unless --include_beliefs
               }
             }
@@ -61,12 +62,11 @@ Pandas loading recipe:
                       "ckpt": int(ckpt_str), "seed": int(seed_str)}
               for probe, mdict in sd.get("metrics", {}).items():
                   metric_rows.append({**base, "probe": probe, **mdict})
-              ep = sd.get("ep_returns")
-              if ep:
+              mean_ret = sd.get("mean_ep_return")
+              if mean_ret is not None:
                   reward_rows.append({**base,
-                      "mean_ep_return": sum(ep) / len(ep),
-                      "std_ep_return":  float(pd.Series(ep).std()),
-                      "ep_returns":     ep})
+                      "mean_ep_return": mean_ret,
+                      "std_ep_return":  sd.get("std_ep_return", 0.0)})
 
   metrics_df = pd.DataFrame(metric_rows)
   rewards_df = pd.DataFrame(reward_rows)
@@ -138,11 +138,12 @@ def _load_seed_metrics(path: Path, include_beliefs: bool) -> Optional[dict]:
     return out
 
 
-def _load_ep_returns(npz_path: Path) -> Optional[Dict[str, list]]:
-    """Compute per-episode returns for each seed from an NPZ trajectory file.
+def _load_ep_returns(npz_path: Path) -> Optional[Dict[str, dict]]:
+    """Compute per-episode return summary stats for each seed from an NPZ trajectory file.
 
     Rewards are shaped [n_seeds, n_traj, max_len]; masks mark valid timesteps.
-    Returns {seed_idx_str: [ep_return, ...]} or None if file is absent.
+    Returns {seed_idx_str: {"mean_ep_return": float, "std_ep_return": float}}
+    or None if file is absent.
     """
     if not npz_path.exists():
         return None
@@ -151,7 +152,13 @@ def _load_ep_returns(npz_path: Path) -> Optional[Dict[str, list]]:
         rewards = d["rewards"]                           # [n_seeds, n_traj, T]
         masks   = d["masks"].astype(np.float32)          # [n_seeds, n_traj, T]
         ep_ret  = (rewards * masks).sum(axis=-1)         # [n_seeds, n_traj]
-        return {str(s): ep_ret[s].tolist() for s in range(ep_ret.shape[0])}
+        return {
+            str(s): {
+                "mean_ep_return": float(np.mean(ep_ret[s])),
+                "std_ep_return": float(np.std(ep_ret[s])),
+            }
+            for s in range(ep_ret.shape[0])
+        }
     except Exception as e:
         print(f"    [warn] could not load {npz_path}: {e}", file=sys.stderr)
         return None
@@ -195,7 +202,7 @@ def estimate_size(results_dir: Path, include_beliefs: bool) -> None:
             ep = _load_ep_returns(ckpt_dir / "h0_trajectories.npz")
             if ep:
                 for s, v in ep.items():
-                    seeds.setdefault(s, {})["ep_returns"] = v
+                    seeds.setdefault(s, {}).update(v)
             if seeds:
                 ckpts[str(ckpt_idx)] = {"seeds": seeds}
         sample_runs.append({"run_id": run_dir.name, "config": config,
@@ -258,13 +265,13 @@ def collect(results_dir: Path, include_beliefs: bool = False) -> dict:
                     seeds.setdefault(s_idx, {}).update(rec)
                     n_metric_records += 1
 
-            # Per-episode returns from NPZ trajectory file
+            # Per-episode return stats from NPZ trajectory file
             ep_returns = _load_ep_returns(ckpt_dir / "h0_trajectories.npz")
             if ep_returns is None:
                 n_missing_npz += 1
             else:
-                for s_idx, returns in ep_returns.items():
-                    seeds.setdefault(s_idx, {})["ep_returns"] = returns
+                for s_idx, stats in ep_returns.items():
+                    seeds.setdefault(s_idx, {}).update(stats)
                     n_ep_return_seeds += 1
 
             if seeds:

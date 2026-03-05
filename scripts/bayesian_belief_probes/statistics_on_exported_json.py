@@ -186,12 +186,11 @@ def load_and_build_dataframes(
                 for probe, mdict in sd.get("metrics", {}).items():
                     metric_rows.append({**row_base, "probe": probe, **mdict})
 
-                ep = sd.get("ep_returns")
-                if ep:
+                mean_ret = sd.get("mean_ep_return")
+                if mean_ret is not None:
                     reward_rows.append({**row_base,
-                        "mean_ep_return": float(np.mean(ep)),
-                        "std_ep_return":  float(np.std(ep)),
-                        "n_episodes":     len(ep)})
+                        "mean_ep_return": float(mean_ret),
+                        "std_ep_return":  float(sd.get("std_ep_return", 0.0))})
 
     metrics_df = pd.DataFrame(metric_rows)
     rewards_df = pd.DataFrame(reward_rows)

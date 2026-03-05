@@ -6,9 +6,10 @@ set -euo pipefail
 #   MEMORYLESS, BATCH_DIR
 
 # ---- Fixed constants ----
-N_SEEDS=1
+N_SEEDS=8
 SEED=2026
-TOTAL_STEPS=256000000      # individual transitions; scan steps = TOTAL_STEPS / NUM_ENVS
+NUM_CHECKPOINTS=10
+: "${TOTAL_STEPS:?TOTAL_STEPS not set -- must be exported by array_launch.sh}"
 BUFFER_SIZE=1000000
 EPSILON_FINISH=0.05        # fixed (sweep showed low sensitivity)
 
@@ -61,6 +62,14 @@ python -c "import jax; print(jax.devices()); print('Backend:', jax.default_backe
 echo "--- GPU info ---"
 nvidia-smi --query-gpu=name,memory.total,memory.free,utilization.gpu --format=csv,noheader || true
 
+# ---- Divisibility preflight ----
+DIVISOR=$(( NUM_ENVS * NUM_CHECKPOINTS ))
+REM=$(( TOTAL_STEPS % DIVISOR ))
+if [[ "$REM" -ne 0 ]]; then
+  echo "ERROR: total_steps=$TOTAL_STEPS not divisible by $DIVISOR"
+  exit 2
+fi
+
 echo "Running $MEM_TAG: study_name=${BATCH_DIR}/${STUDY_NAME}"
 
 CMD=(srun python -m pobax.algos.dqn
@@ -84,7 +93,7 @@ CMD=(srun python -m pobax.algos.dqn
   --action_concat
   --study_name "${BATCH_DIR}/${STUDY_NAME}"
   --save_checkpoints
-  --num_checkpoints 20
+  --num_checkpoints "$NUM_CHECKPOINTS"
 )
 
 if [ "$MEMORYLESS" = "True" ]; then
