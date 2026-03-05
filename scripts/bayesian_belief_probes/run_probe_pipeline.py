@@ -64,8 +64,16 @@ def _resolve_run_dir(path: Path) -> Path:
     )
 
 
+def _is_ocdbt_checkpoint(path: Path) -> bool:
+    """Return True if path is an OCDBT-format Orbax checkpoint (not a run/batch dir)."""
+    return any(item.is_dir() and item.name.startswith("ocdbt.")
+               for item in path.iterdir())
+
+
 def _is_batch_dir(path: Path) -> bool:
     """Return True if path contains multiple non-checkpoint subdirs (batch mode)."""
+    if _is_ocdbt_checkpoint(path):
+        return False
     subdirs = [d for d in path.iterdir()
                if d.is_dir() and not d.name.startswith("checkpoint_")]
     return len(subdirs) > 1
@@ -126,7 +134,7 @@ def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
     env_name      = str(run_args["env"])
     hidden_size   = int(run_args["hidden_size"])
     n_seeds       = int(run_args["n_seeds"])
-    algo          = str(run_args.get("algo", "ppo"))
+    algo          = str(run_args["algo"])
     double_critic = bool(run_args.get("double_critic", False))
     memoryless    = bool(run_args.get("memoryless", False))
     action_concat = bool(run_args.get("action_concat", False))
@@ -147,6 +155,14 @@ def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
     trace_length     = _scalar(run_args.get("trace_length"),     int,   0)
     buffer_batch_size = _scalar(run_args.get("buffer_batch_size"), int, 0)
     num_envs         = _scalar(run_args.get("num_envs"),         int,   0)
+    # Transformer-specific (only used when algo == 'transformer_xl')
+    embed_size    = _scalar(run_args.get("embed_size"),    int,   256)
+    num_heads     = _scalar(run_args.get("num_heads"),     int,   8)
+    qkv_features  = _scalar(run_args.get("qkv_features"),  int,   256)
+    num_layers    = _scalar(run_args.get("num_layers"),    int,   2)
+    window_mem    = _scalar(run_args.get("window_mem"),    int,   128)
+    gating        = bool(run_args.get("gating", True))
+    gating_bias   = _scalar(run_args.get("gating_bias"),   float, 2.0)
 
     print(
         f"  algo={algo}, env={env_name}, hidden_size={hidden_size}, "
@@ -180,11 +196,19 @@ def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
         "entropy_coeff":    entropy_coeff,
         "total_steps":      total_steps,
         "h_idx":            args.h_idx,
-        # DQN-specific (zero for PPO runs)
+        # DQN-specific (zero for PPO/transformer runs)
         "lr":               lr,
         "trace_length":     trace_length,
         "buffer_batch_size": buffer_batch_size,
         "num_envs":         num_envs,
+        # Transformer-specific (defaults for PPO/DQN runs)
+        "embed_size":       embed_size,
+        "num_heads":        num_heads,
+        "qkv_features":     qkv_features,
+        "num_layers":       num_layers,
+        "window_mem":       window_mem,
+        "gating":           gating,
+        "gating_bias":      gating_bias,
     }
     config_path = out_dir / "run_config.json"
     with open(config_path, "w") as f:
@@ -215,6 +239,17 @@ def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
         if npz_path.exists() and not args.force:
             print(f"  NPZ already exists, skipping sampling: {npz_path}")
         else:
+            transformer_kwargs = {}
+            if algo == 'transformer_xl':
+                transformer_kwargs = dict(
+                    embed_size=embed_size,
+                    num_heads=num_heads,
+                    qkv_features=qkv_features,
+                    num_layers=num_layers,
+                    window_mem=window_mem,
+                    gating=gating,
+                    gating_bias=gating_bias,
+                )
             sample_and_save(
                 ckpt_path=ckpt_dir,
                 h_idx=args.h_idx,
@@ -229,6 +264,7 @@ def _process_one_run(run_dir_raw: Path, out_dir: Path, args) -> None:
                 action_concat=action_concat,
                 algo=algo,
                 env_seed=int(run_args["seed"]),
+                **transformer_kwargs,
             )
 
         # --- Step 2: train probes for each seed sequentially ---

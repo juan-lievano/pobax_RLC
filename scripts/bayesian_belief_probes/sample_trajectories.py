@@ -42,6 +42,7 @@ from pobax.envs.wrappers.gymnax import Observation
 from pobax.models.actor_critic import ActorCritic
 from pobax.models.q_network import QNetwork
 from pobax.models.network import ScannedRNN
+from pobax.models.discrete import DiscreteActorCriticTransformer
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,130 @@ def build_rollout_fn(
 
 
 # ---------------------------------------------------------------------------
+# Transformer rollout
+# ---------------------------------------------------------------------------
+
+def build_transformer_rollout_fn(
+    model,
+    env,
+    env_params,
+    max_len: int,
+    extras_fn,
+    extras_dim: int,
+    action_concat: bool,
+    action_dim: int,
+    embed_size: int,
+    num_heads: int,
+    num_layers: int,
+    window_mem: int,
+):
+    """Like build_rollout_fn but for GTrXL transformer models.
+
+    Key differences: manages memories/mask state instead of GRU carry, calls
+    forward_with_embedding via the transformer interface (no Observation wrapper).
+    """
+
+    def rollout_single(rng_key, params_one_seed):
+        rng, rng_reset = jr.split(rng_key)
+        obs, state = env.reset_env(rng_reset, env_params)
+
+        memories = jnp.zeros((1, window_mem, num_layers, embed_size))
+        memories_mask = jnp.zeros((1, num_heads, 1, window_mem + 1), dtype=jnp.bool_)
+        memories_mask_idx = jnp.array([window_mem + 1], dtype=jnp.int32)
+        done = jnp.array(False)
+        prev_action_onehot = jnp.zeros(action_dim, dtype=jnp.float32)
+
+        def step_fn(carry, _):
+            rng, state, obs, memories, memories_mask, memories_mask_idx, done, prev_action_onehot = carry
+            rng, k_step, k_act = jr.split(rng, 3)
+
+            # --- mask management (mirrors transformer_xl.py:env_step lines 127-135) ---
+            memories_mask_idx = jnp.where(done, window_mem, jnp.clip(memories_mask_idx - 1, 0, window_mem))
+            memories_mask = jnp.where(
+                done[None, None, None],
+                jnp.zeros((1, num_heads, 1, window_mem + 1), dtype=jnp.bool_),
+                memories_mask,
+            )
+            memories_mask_idx_ohot = jax.nn.one_hot(memories_mask_idx, window_mem + 1)
+            memories_mask_idx_ohot = memories_mask_idx_ohot[:, None, None, :].repeat(num_heads, 1)
+            memories_mask = jnp.logical_or(memories_mask, memories_mask_idx_ohot)
+
+            # --- build obs for model ---
+            if action_concat:
+                obs_model = jnp.concatenate([obs, prev_action_onehot])
+            else:
+                obs_model = obs
+            obs_in = obs_model[None, :].astype(jnp.float32)  # [1, obs_dim]
+
+            pi, _, memory_out, embedding = model.apply(
+                params_one_seed, memories, obs_in, memories_mask,
+                method=model.forward_with_embedding,
+            )
+
+            # Batch=1: squeeze action to scalar for env.step_env
+            action = pi.sample(seed=k_act).squeeze().astype(jnp.int32)
+
+            # --- update memories ---
+            memories_new = jnp.roll(memories, -1, axis=1).at[:, -1].set(memory_out)
+
+            # Freeze after episode ends
+            memories_rec = jnp.where(done, memories, memories_new)
+            mask_out = jnp.logical_not(done)
+
+            next_obs, next_state, reward, next_done, _ = env.step_env(
+                k_step, state, action, env_params
+            )
+            reward_rec = jnp.where(done, jnp.zeros_like(reward), reward)
+            next_done_flag = jnp.logical_or(done, next_done)
+
+            new_prev_action_onehot = jnp.eye(action_dim, dtype=jnp.float32)[action]
+            new_prev_action_onehot = jnp.where(done, prev_action_onehot, new_prev_action_onehot)
+
+            next_carry = (
+                rng,
+                jax.tree_util.tree_map(
+                    lambda a, b: jnp.where(done, a, b), state, next_state
+                ),
+                jnp.where(done, obs, next_obs.astype(jnp.float32)),
+                memories_rec,
+                jnp.where(done, memories_mask,
+                          jnp.where(done[None, None, None],
+                                    jnp.zeros_like(memories_mask), memories_mask)),
+                jnp.where(done, memories_mask_idx, memories_mask_idx),
+                next_done_flag,
+                new_prev_action_onehot,
+            )
+
+            # Batch=1: squeeze batch dim from embedding [1, embed_size] → [embed_size]
+            activations = embedding.squeeze(0)  # [embed_size]
+
+            step_out = (
+                obs,
+                action,
+                extras_fn(state),
+                activations,
+                mask_out,
+                reward_rec,
+            )
+            return next_carry, step_out
+
+        init_carry = (rng, state, obs.astype(jnp.float32),
+                       memories, memories_mask, memories_mask_idx, done, prev_action_onehot)
+        _, (obs_seq, act_seq, extras_seq, hid_seq, mask_seq, rew_seq) = lax.scan(
+            step_fn, init_carry, None, max_len
+        )
+        length = mask_seq.sum(dtype=jnp.int32)
+        return obs_seq, act_seq, extras_seq, hid_seq, mask_seq, length, rew_seq
+
+    def rollout_all_seeds(params_all_seeds, rng_keys):
+        def _one_seed(params_one_seed):
+            return jax.vmap(rollout_single, in_axes=(0, None))(rng_keys, params_one_seed)
+        return jax.vmap(_one_seed)(params_all_seeds)
+
+    return jax.jit(rollout_all_seeds)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -196,12 +321,32 @@ def sample_and_save(
     action_concat: bool,
     algo: str = 'ppo',
     env_seed: int = 0,
+    # transformer-specific (only used when algo == 'transformer_xl')
+    embed_size: int = 256,
+    num_heads: int = 8,
+    qkv_features: int = 256,
+    num_layers: int = 2,
+    window_mem: int = 128,
+    gating: bool = True,
+    gating_bias: float = 2.0,
 ):
     handler = get_env_handler(env_name, seed=env_seed)
     env, env_params = handler.make_raw_env()
 
     # Build model (structure must match the training run)
-    if algo == 'dqn':
+    if algo == 'transformer_xl':
+        model = DiscreteActorCriticTransformer(
+            action_dim=handler.action_dim(),
+            encoder_size=embed_size,
+            num_heads=num_heads,
+            qkv_features=qkv_features,
+            num_layers=num_layers,
+            double_critic=double_critic,
+            hidden_size=hidden_size,
+            gating=gating,
+            gating_bias=gating_bias,
+        )
+    elif algo == 'dqn':
         model = QNetwork(
             env_name,
             handler.action_dim(),
@@ -235,13 +380,25 @@ def sample_and_save(
     # Build JIT-compiled rollout
     extras_fn  = handler.get_jax_extras_fn()
     extras_dim = handler.extras_flat_dim()
-    rollout_fn = build_rollout_fn(
-        model, env, env_params, hidden_size, max_len, memoryless,
-        extras_fn, extras_dim,
-        action_concat=action_concat,
-        action_dim=handler.action_dim(),
-        algo=algo,
-    )
+    if algo == 'transformer_xl':
+        rollout_fn = build_transformer_rollout_fn(
+            model, env, env_params, max_len,
+            extras_fn, extras_dim,
+            action_concat=action_concat,
+            action_dim=handler.action_dim(),
+            embed_size=embed_size,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            window_mem=window_mem,
+        )
+    else:
+        rollout_fn = build_rollout_fn(
+            model, env, env_params, hidden_size, max_len, memoryless,
+            extras_fn, extras_dim,
+            action_concat=action_concat,
+            action_dim=handler.action_dim(),
+            algo=algo,
+        )
 
     # Same rng_keys for all seeds (same starting states, different policies)
     rng = jr.PRNGKey(seed)
@@ -314,6 +471,19 @@ if __name__ == "__main__":
     main_results = checkpointer.restore(args.run_dir)
     run_args = main_results["args"]
 
+    algo = str(run_args.get("algo", "ppo"))
+    extra_kwargs = {}
+    if algo == 'transformer_xl':
+        extra_kwargs = dict(
+            embed_size=int(run_args.get("embed_size", 256)),
+            num_heads=int(run_args.get("num_heads", 8)),
+            qkv_features=int(run_args.get("qkv_features", 256)),
+            num_layers=int(run_args.get("num_layers", 2)),
+            window_mem=int(run_args.get("window_mem", 128)),
+            gating=bool(run_args.get("gating", True)),
+            gating_bias=float(run_args.get("gating_bias", 2.0)),
+        )
+
     sample_and_save(
         ckpt_path=args.ckpt_path,
         h_idx=args.h_idx,
@@ -326,5 +496,6 @@ if __name__ == "__main__":
         double_critic=bool(run_args.get("double_critic", False)),
         memoryless=bool(run_args.get("memoryless", False)),
         action_concat=bool(run_args.get("action_concat", False)),
-        algo=str(run_args.get("algo", "ppo")),
+        algo=algo,
+        **extra_kwargs,
     )
