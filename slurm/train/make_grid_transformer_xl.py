@@ -7,7 +7,7 @@ TRACE_LENGTH, NUM_ENVS, BUFFER_BATCH_SIZE are set to "0" (unused by transformer)
 Hyperparameter choices:
   - LR: sweep 1e-4, 5e-4, 1e-3 (same spread as DQN/PPO)
   - DOUBLE_CRITIC: both true and false
-  - ENTROPY_COEFF: fixed at 0.01 (PPO default)
+  - ENTROPY_COEFF: sweep 0.01 and 0.1
 
 TOTAL_STEPS = 50,135,040  (~50M, divisible by 64*128*20 = 163,840)
 
@@ -31,7 +31,7 @@ ENVS = [
 # ---- GTrXL grid ----
 LRS = ["1e-4", "5e-4", "1e-3"]
 DOUBLE_CRITICS = ["false", "true"]
-ENTROPY_COEFF = "0.01"
+ENTROPY_COEFFS = ["0.01", "0.1"]
 HIDDEN_SIZE = "128"
 
 # ~50M steps, divisible by 64 * 128 * 20 = 163,840
@@ -60,13 +60,13 @@ def transformer_rows() -> list:
     rows = []
     skipped = []
 
-    for env, lr, dc in product(ENVS, LRS, DOUBLE_CRITICS):
+    for env, lr, dc, ent in product(ENVS, LRS, DOUBLE_CRITICS, ENTROPY_COEFFS):
         if not check_divisibility(TOTAL_STEPS, NUM_ENVS_FIXED, NUM_STEPS_FIXED, NUM_CHECKPOINTS):
-            skipped.append(f"GTrXL env={env} lr={lr} dc={dc}")
+            skipped.append(f"GTrXL env={env} lr={lr} dc={dc} ent={ent}")
             continue
         rows.append((
             "transformer_xl", env, HIDDEN_SIZE, "False", str(TOTAL_STEPS),
-            dc, ENTROPY_COEFF, lr,
+            dc, ent, lr,
             "0",   # TRACE_LENGTH (unused)
             "0",   # NUM_ENVS (unused; actual num_envs is hardcoded in run_transformer_xl.sh)
             "0",   # BUFFER_BATCH_SIZE (unused)
@@ -84,6 +84,8 @@ def main() -> None:
     rows = transformer_rows()
     dc_true = [r for r in rows if r[5] == "true"]
     dc_false = [r for r in rows if r[5] == "false"]
+    ent_001 = [r for r in rows if r[6] == "0.01"]
+    ent_01 = [r for r in rows if r[6] == "0.1"]
 
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         f.write(HEADER + "\n")
@@ -93,6 +95,8 @@ def main() -> None:
     print(f"Wrote {len(rows)} rows to {OUT_PATH}")
     print(f"  double_critic=false rows: {len(dc_false)}")
     print(f"  double_critic=true  rows: {len(dc_true)}")
+    print(f"  entropy=0.01 rows:        {len(ent_001)}")
+    print(f"  entropy=0.1  rows:        {len(ent_01)}")
     print(f"\nSubmit:")
     print(f"  GRID_FILE=/nas/ucb/juanlievano/pobax_RLC/slurm/train/grid_transformer_xl.tsv \\")
     print(f"    sbatch --array=0-{len(rows)-1} slurm/train/array_launch.sh")

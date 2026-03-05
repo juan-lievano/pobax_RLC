@@ -17,9 +17,10 @@ NUM_EVAL_ENVS=256
 STEPS_LOG_FREQ=32
 PLATFORM=gpu
 
-# Lambdas constant for all envs
-LAMBDA0="0.9"
-LAMBDA1="0.5"
+# Lambdas / LD weight constants for all envs
+# (kept hardcoded by design for this sweep family)
+LAMBDA0="0.7"
+LAMBDA1="0.95"
 LD_WEIGHT="0.25"
 
 # Action concat: always on
