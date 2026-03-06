@@ -6,7 +6,7 @@ set -euo pipefail
 #   MEMORYLESS, BATCH_DIR
 
 # ---- Fixed constants ----
-N_SEEDS=8
+N_SEEDS=2
 SEED=2026
 NUM_CHECKPOINTS=10
 : "${TOTAL_STEPS:?TOTAL_STEPS not set -- must be exported by array_launch.sh}"
