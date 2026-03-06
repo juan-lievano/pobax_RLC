@@ -5,7 +5,8 @@ set -euo pipefail
 #   RUN_DIR  — absolute path to the timestamped run directory
 
 # ---- Probe pipeline hyperparams ----
-N_TIMESTEPS=10000
+N_TIMESTEPS=5000
+N_TRAJ=250
 H_IDX=0
 EPOCHS=80
 BATCH_SIZE=1024
@@ -32,6 +33,7 @@ echo "Start time:  $(date)"
 echo "RUN_DIR:     $RUN_DIR"
 echo "OUT_DIR:     $OUT_DIR"
 echo "N_TIMESTEPS: $N_TIMESTEPS"
+echo "N_TRAJ:      $N_TRAJ"
 echo "=============================="
 
 if [[ ! -d "$RUN_DIR" ]]; then
@@ -45,6 +47,7 @@ python -c "import jax; print(jax.devices()); print('Backend:', jax.default_backe
 srun python scripts/bayesian_belief_probes/run_probe_pipeline.py \
   --run_dir     "$RUN_DIR"     \
   --out_dir     "$OUT_DIR"     \
+  --n_traj      "$N_TRAJ"      \
   --n_timesteps "$N_TIMESTEPS" \
   --h_idx       "$H_IDX"       \
   --epochs      "$EPOCHS"      \
